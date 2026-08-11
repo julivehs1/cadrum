@@ -284,3 +284,133 @@ fn test_share_preserves_ids_and_history() {
 	let cloned_edges: HashSet<u64> = cloned.iter_edge().map(|e| e.id()).collect();
 	assert!(cloned_edges.is_disjoint(&orig_edges), "Clone deep-copies → fresh ids (contrast to share)");
 }
+
+/// extrude, eine Dimension höher: **eine** Mantelfläche je Profil-Segment.
+/// Das ist die schärfere Hälfte der Herkunft — dasselbe Segment erzeugt vier
+/// Kanten, von denen zwei den Nachbarn gehören, aber genau eine Fläche. Ein
+/// Name, der auf Flächen aufgelöst wird, trifft deshalb, was der Aufrufer
+/// meinte; derselbe Name auf Kanten nimmt die Nähte mit.
+#[test]
+fn test_extrude_populates_generated_faces_from_profile() {
+	let profile = square(4.0);
+	let profile_ids: HashSet<u64> = profile.iter().map(|e| e.id()).collect();
+	let extruded = Solid::extrude(&profile, DVec3::Z * 3.0).expect("extrude");
+
+	let gen: Vec<[u64; 2]> = extruded.iter_generated_faces().collect();
+	// Genau eine Fläche je Segment — nicht vier wie bei den Kanten.
+	for id in &profile_ids {
+		let n = gen.iter().filter(|[_, s]| s == id).count();
+		assert_eq!(n, 1, "Segment {id} wächst zu genau einer Mantelfläche, gemeldet: {n}");
+	}
+	let lateral: HashSet<u64> = gen.iter().filter(|[_, s]| *s != 0).map(|[f, _]| *f).collect();
+	assert_eq!(lateral.len(), 4, "vier Segmente, vier verschiedene Mantelflächen");
+
+	// Jede gemeldete Fläche gehört zum Ergebnis, und keine Ergebnis-Fläche
+	// bleibt namenlos (die Deckel/Boden-Id kommt über das Kappen-Paar dazu).
+	let all: HashSet<u64> = extruded.iter_face().map(|f| f.id()).collect();
+	let covered: HashSet<u64> = gen.iter().map(|[f, _]| *f).collect();
+	assert_eq!(all, covered, "jede Ergebnis-Fläche muss eine Herkunft haben");
+}
+
+/// **Die Messung, an der die ganze Flächen-Benennung hängt**: Deckel und Boden
+/// eines Prismas teilen sich EINE TShape-Id, weil OCCT den Deckel als dieselbe
+/// TShape unter anderer `TopLoc_Location` baut und `subshape_id` die Location
+/// bewusst ignoriert (siehe cpp/wrapper.cpp). Ein Prisma über einem Quadrat hat
+/// nach Euler 6 Flächen — gemeldet werden 5 Ids.
+///
+/// Folge für den Aufrufer: ein Name kann eine Kappe von den Mantelflächen
+/// trennen, aber **nicht Deckel von Boden**. Diese Unterscheidung bleibt
+/// geometrisch, genau wie bei den Kanten. Steht der Test eines Tages auf 6
+/// verschiedenen Ids, ist die Einschränkung weg und der Aufrufer darf mehr.
+#[test]
+fn test_extrude_caps_share_one_tshape_id() {
+	use cadrum::Surface;
+	let height = 3.0;
+	let extruded = Solid::extrude(&square(4.0), DVec3::Z * height).expect("extrude");
+
+	let ids: Vec<u64> = extruded.iter_face().map(|f| f.id()).collect();
+	assert_eq!(ids.len(), 6, "ein Prisma über einem Quadrat hat 6 Flächen");
+	assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 5, "aber nur 5 verschiedene Ids — Deckel und Boden teilen eine");
+
+	// Die geteilte Id ist genau die, die als Kappe (Quelle 0) gemeldet wird.
+	let caps: Vec<u64> = extruded.iter_generated_faces().filter(|[_, s]| *s == 0).map(|[f, _]| f).collect();
+	assert_eq!(caps.len(), 1, "beide Kappen fallen auf ein Paar zusammen");
+	let sharing: Vec<&cadrum::Face> = extruded.iter_face().filter(|f| f.id() == caps[0]).collect();
+	assert_eq!(sharing.len(), 2, "unter der Kappen-Id liegen zwei Flächen");
+
+	// … und die beiden sind wirklich Boden und Deckel: gleiche Ebene, gegenläufige
+	// Normale, Höhe auseinander.
+	let mut z: Vec<f64> = Vec::new();
+	for f in &sharing {
+		match f.surface() {
+			Surface::Plane { origin, normal } => {
+				assert!(normal.dot(DVec3::Z).abs() > 0.99, "Kappe steht senkrecht zur Zugrichtung");
+				z.push(origin.z);
+			}
+			_ => panic!("eine Kappe ist eben"),
+		}
+	}
+	z.sort_by(f64::total_cmp);
+	assert!((z[1] - z[0] - height).abs() < 1e-9, "Boden bei 0, Deckel bei {height}, gemessen {z:?}");
+}
+
+/// revolve: bei **voller Umdrehung** meldet OCCT nur die Rotationsflächen. Die
+/// Ringflächen, die aus den radialen Profil-Segmenten wachsen, kommen ohne
+/// Eintrag — und Kappen gibt es keine, weil Anfang und Ende zusammenfallen.
+/// Bei Teilumdrehung ist die Tabelle vollständig. Wer Flächennamen über einen
+/// vollen Umlauf verspricht, verspricht zu viel; das ist die Grenze.
+#[test]
+fn test_revolve_full_turn_reports_only_faces_of_revolution() {
+	// Rechteck 2..4 × 0..3 um Z: ein Rohrstück. Voll: 2 Zylinder + 2 Ringe.
+	let profile = Edge::polygon(&[DVec3::new(2.0, 0.0, 0.0), DVec3::new(4.0, 0.0, 0.0), DVec3::new(4.0, 0.0, 3.0), DVec3::new(2.0, 0.0, 3.0)]).expect("profile");
+
+	let full = Solid::revolve(&profile, DVec3::ZERO, DVec3::Z, TAU).expect("revolve full");
+	assert_eq!(full.iter_face().count(), 4, "Rohrstück: zwei Zylinder, zwei Ringflächen");
+	let gen: Vec<[u64; 2]> = full.iter_generated_faces().collect();
+	assert_eq!(gen.iter().filter(|[_, s]| *s == 0).count(), 0, "voller Umlauf hat keine Kappen");
+	assert_eq!(gen.len(), 2, "nur die beiden Rotationsflächen werden gemeldet");
+	for [f, _] in &gen {
+		let face = full.iter_face().find(|x| x.id() == *f).expect("gemeldete Fläche gehört zum Ergebnis");
+		assert!(matches!(face.surface(), cadrum::Surface::Cylinder { .. }), "gemeldet werden die Zylinder");
+	}
+	let covered: HashSet<u64> = gen.iter().map(|[f, _]| *f).collect();
+	let all: HashSet<u64> = full.iter_face().map(|f| f.id()).collect();
+	assert_eq!(all.difference(&covered).count(), 2, "die beiden Ringflächen bleiben namenlos");
+
+	// Halbe Umdrehung: jede Fläche hat eine Herkunft, und die beiden Schnittkappen
+	// fallen — wie Deckel und Boden beim Prisma — auf eine Id zusammen.
+	let half = Solid::revolve(&profile, DVec3::ZERO, DVec3::Z, TAU / 2.0).expect("revolve half");
+	let gen_half: Vec<[u64; 2]> = half.iter_generated_faces().collect();
+	let covered_half: HashSet<u64> = gen_half.iter().map(|[f, _]| *f).collect();
+	let all_half: HashSet<u64> = half.iter_face().map(|f| f.id()).collect();
+	assert_eq!(all_half, covered_half, "bei Teilumdrehung bleibt keine Fläche ohne Herkunft");
+	assert_eq!(gen_half.iter().filter(|[_, s]| *s == 0).count(), 1, "zwei Schnittflächen, eine Id");
+	assert_eq!((half.iter_face().count(), all_half.len()), (6, 5), "6 Flächen unter 5 Ids (die zwei Schnittflächen teilen eine)");
+}
+
+/// Der Weg, den ein Flächenname durch einen Boolean nimmt: die Wand einer
+/// Bohrung ist `Modified(tool_face)` — sie erbt also die Identität der
+/// Werkzeug-Fläche und damit deren Namen. Zusammen mit der Geburt beim extrude
+/// heißt das: der Mantel eines Bohrwerkzeugs bleibt im fertigen Körper
+/// auffindbar, ohne ihn geometrisch zu suchen.
+#[test]
+fn test_boolean_carries_a_generated_tool_face_into_the_result() {
+	let circle = [Edge::circle(1.5, DVec3::Z).expect("circle")];
+	let tool = Solid::extrude(&circle, DVec3::Z * 5.0).expect("tool").translate(DVec3::new(5.0, 5.0, -1.0));
+	// Der Mantel des Werkzeugs, benannt aus seinem Profil (Quelle != 0).
+	let wall: Vec<u64> = tool.iter_generated_faces().filter(|[_, s]| *s != 0).map(|[f, _]| f).collect();
+	assert_eq!(wall.len(), 1, "ein Kreis-Profil wächst zu genau einer Mantelfläche");
+
+	let block = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
+	let drilled: Solid = (&block - &tool).build().expect("cut");
+	let live: HashSet<u64> = drilled.iter_face().map(|f| f.id()).collect();
+	let inherited: Vec<u64> = drilled.iter_history().filter(|[p, s]| *s == wall[0] && live.contains(p)).map(|[p, _]| p).collect();
+	assert_eq!(inherited.len(), 1, "die Bohrungswand stammt laut history von der Werkzeugfläche");
+
+	// Und sie ist wirklich die Bohrung: Zylinder mit dem Radius des Profils.
+	let hole = drilled.iter_face().find(|f| f.id() == inherited[0]).expect("Fläche im Ergebnis");
+	match hole.surface() {
+		cadrum::Surface::Cylinder { radius, .. } => assert!((radius - 1.5).abs() < 1e-9, "r=1.5 erwartet, {radius}"),
+		s => panic!("Bohrungswand ist ein Zylinder, nicht {s:?}"),
+	}
+}

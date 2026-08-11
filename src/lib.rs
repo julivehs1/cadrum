@@ -176,7 +176,9 @@ impl Solid {
 	pub fn iter_generated_edges(&self) -> impl Iterator<Item = [u64; 2]> + '_ {
 		<Self as crate::traits::SolidStruct>::iter_generated_edges(self)
 	}
-	/// **Is this solid sound?** — see [`traits::SolidStruct::is_valid`].
+	pub fn iter_generated_faces(&self) -> impl Iterator<Item = [u64; 2]> + '_ {
+		<Self as crate::traits::SolidStruct>::iter_generated_faces(self)
+	}
 	pub fn is_valid(&self) -> bool {
 		<Self as crate::traits::SolidStruct>::is_valid(self)
 	}

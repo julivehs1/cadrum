@@ -375,22 +375,33 @@ std::unique_ptr<TopoDS_Edge> mirror_edge(
 // pickable by origin instead of by geometric search. Bottom/top rim segments
 // and the two shared vertical edges all belong to their segment's lateral
 // face; a vertical edge legitimately appears under both neighbours.
+//
+// `out_gen_faces`: flat [gen_face, src_edge] pairs — the same relation one
+// dimension up, and the sharper one: a profile segment grows exactly ONE
+// lateral face where it grows four edges, two of them shared with the
+// neighbours. Plus the cap pairs [cap_face, 0] (see emit_sweep_caps in
+// wrapper.cpp): src 0 reads "the profile as a whole", because a cap is bounded
+// by every segment and belongs to none.
 std::unique_ptr<TopoDS_Shape> make_extrude(
     const std::vector<TopoDS_Edge>& profile_edges,
     double dx, double dy, double dz,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges);
 
 // Revolve a closed profile wire around the axis (origin, direction) by
 // `angle` radians using BRepPrimAPI_MakeRevol. Internally builds
 // Wire → Face → Revol. The profile must not cross the axis.
 //
-// `out_gen_edges`: as in make_extrude — [gen_edge, src_edge] pairs from
-// Generated(), the birth of an edge name.
+// `out_gen_faces` / `out_gen_edges`: as in make_extrude — the birth of a name.
+// One caveat is the full turn: at 360° there are no cap faces, and OCCT then
+// reports Generated() only for the profile edges that sweep a lateral surface
+// (a radial edge's annulus arrives with no entry).
 std::unique_ptr<TopoDS_Shape> make_revolve(
     const std::vector<TopoDS_Edge>& profile_edges,
     double ox, double oy, double oz,
     double dx, double dy, double dz,
     double angle,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges);
 
 // Sweep a closed profile wire (built from `profile_edges`) along a spine

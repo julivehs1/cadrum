@@ -622,14 +622,19 @@ static void emit_generated_edges(
     }
 }
 
-// Emit **Generated** edge pairs [gen_edge, src_edge] for a sweep-style maker
-// (extrude/revolve) whose sources are the profile edges rather than sub-shapes
-// of an existing solid: Generated() gives the lateral face grown from each
-// profile edge, and every edge of that face is "generated from" it.
+// Emit **Generated** face pairs [gen_face, src_edge] and edge pairs
+// [gen_edge, src_edge] for a sweep-style maker (extrude/revolve) whose sources
+// are the profile edges rather than sub-shapes of an existing solid:
+// Generated() gives the lateral face grown from each profile edge — that face
+// IS the face pair, and every edge bounding it is "generated from" the same
+// profile edge.
 //
-// This is the BIRTH of an edge name — extrude/revolve rebuild topology
-// wholesale, so without this table nothing in the result can be traced back to
-// the sketch segment it came from.
+// This is the BIRTH of a name — extrude/revolve rebuild topology wholesale, so
+// without this table nothing in the result can be traced back to the sketch
+// segment it came from. The face is the primitive and the edge the derivation:
+// one profile segment grows exactly ONE lateral face but four edges (bottom
+// rim, top rim, two verticals shared with the neighbours), which is why a name
+// resolved on faces is sharper than the same name resolved on edges.
 //
 // `wire_edges[i]` is the edge that actually landed in the swept wire (see
 // BRepBuilderAPI_MakeWire::Edge — MakeWire rebuilds an edge when neighbours
@@ -642,6 +647,7 @@ static void emit_generated_from_profile(
     Builder& builder,
     const std::vector<TopoDS_Edge>& wire_edges,
     const std::vector<uint64_t>& src_ids,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges)
 {
     for (size_t i = 0; i < wire_edges.size() && i < src_ids.size(); ++i) {
@@ -652,11 +658,53 @@ static void emit_generated_from_profile(
         NCollection_List<TopoDS_Shape> gen = builder.Generated(e);
         if (gen.IsEmpty()) gen = builder.Generated(e.Reversed());
         for (NCollection_List<TopoDS_Shape>::Iterator it(gen); it.More(); it.Next()) {
+            if (it.Value().ShapeType() == TopAbs_FACE) {
+                out_gen_faces.push_back(subshape_id(it.Value()));
+                out_gen_faces.push_back(src_ids[i]);
+            }
             for (TopExp_Explorer ge(it.Value(), TopAbs_EDGE); ge.More(); ge.Next()) {
                 out_gen_edges.push_back(subshape_id(ge.Current()));
                 out_gen_edges.push_back(src_ids[i]);
             }
         }
+    }
+}
+
+// Emit the two cap faces of a sweep — the profile face at the start and its
+// swept copy at the end — as [cap_face, CAP_SRC] pairs into the same table.
+//
+// CAP_SRC is 0, an id no TShape can carry (a live TShape* is never null). It
+// reads "the profile as a whole" rather than any one segment: a cap is bounded
+// by EVERY profile edge, so attributing it to one of them would be a lie. A
+// caller that names segments filters by its own profile-edge ids and never
+// sees these; a caller asking "which faces are caps?" looks for src == 0.
+//
+// Usually ONE pair comes out, not two: OCCT builds the end cap as the same
+// TShape under a different TopLoc_Location, which `subshape_id` deliberately
+// ignores, so both caps collapse onto one id (a prism over a square has six
+// faces under five ids). That is the honest report — caps are distinguishable
+// from lateral faces by id, but not from each other; tell top from bottom
+// geometrically, as with edges.
+//
+// Only ids that really occur among the result's faces are emitted: at a full
+// 360° revolution there are no cap faces at all, yet FirstShape()/LastShape()
+// still hand back the profile face, which is not part of the result.
+static constexpr uint64_t CAP_SRC = 0;
+
+template <typename Builder>
+static void emit_sweep_caps(Builder& builder, const TopoDS_Shape& result, rust::Vec<uint64_t>& out_gen_faces)
+{
+    std::unordered_set<uint64_t> live;
+    for (TopExp_Explorer fx(result, TopAbs_FACE); fx.More(); fx.Next()) live.insert(subshape_id(fx.Current()));
+    std::unordered_set<uint64_t> seen;
+    const TopoDS_Shape caps[2] = { builder.FirstShape(), builder.LastShape() };
+    for (const TopoDS_Shape& cap : caps) {
+        if (cap.IsNull() || cap.ShapeType() != TopAbs_FACE) continue;
+        uint64_t id = subshape_id(cap);
+        if (live.find(id) == live.end()) continue;
+        if (!seen.insert(id).second) continue;
+        out_gen_faces.push_back(id);
+        out_gen_faces.push_back(CAP_SRC);
     }
 }
 
@@ -1780,6 +1828,7 @@ std::unique_ptr<TopoDS_Shape> make_revolve(
     double ox, double oy, double oz,
     double dx, double dy, double dz,
     double angle,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges)
 {
     try {
@@ -1799,7 +1848,8 @@ std::unique_ptr<TopoDS_Shape> make_revolve(
         BRepPrimAPI_MakeRevol revol(face_maker.Face(), axis, angle);
         revol.Build();
         if (!revol.IsDone()) return nullptr;
-        emit_generated_from_profile(revol, wire_edges, src_ids, out_gen_edges);
+        emit_generated_from_profile(revol, wire_edges, src_ids, out_gen_faces, out_gen_edges);
+        emit_sweep_caps(revol, revol.Shape(), out_gen_faces);
         return std::make_unique<TopoDS_Shape>(revol.Shape());
     } catch (const Standard_Failure&) {
         return nullptr;
@@ -1809,6 +1859,7 @@ std::unique_ptr<TopoDS_Shape> make_revolve(
 std::unique_ptr<TopoDS_Shape> make_extrude(
     const std::vector<TopoDS_Edge>& profile_edges,
     double dx, double dy, double dz,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges)
 {
     try {
@@ -1828,7 +1879,8 @@ std::unique_ptr<TopoDS_Shape> make_extrude(
         BRepPrimAPI_MakePrism prism(face_maker.Face(), dir);
         prism.Build();
         if (!prism.IsDone()) return nullptr;
-        emit_generated_from_profile(prism, wire_edges, src_ids, out_gen_edges);
+        emit_generated_from_profile(prism, wire_edges, src_ids, out_gen_faces, out_gen_edges);
+        emit_sweep_caps(prism, prism.Shape(), out_gen_faces);
         return std::make_unique<TopoDS_Shape>(prism.Shape());
     } catch (const Standard_Failure&) {
         return nullptr;

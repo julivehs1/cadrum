@@ -63,16 +63,21 @@ fn remap_colormap_by_order(old_inner: &ffi::TopoDS_Shape, new_inner: &ffi::TopoD
 /// (sweep/loft/bspline/scale/mirror/Clone). Preserved across
 /// translate/rotate/color (TShape* unchanged).
 ///
-/// extrude/revolve rebuild topology too and therefore fill **only**
-/// `gen_edges`: every result edge is `Generated()` from a profile edge, which
-/// is what lets a caller trace geometry back to the sketch segment it grew
-/// from.
+/// extrude/revolve rebuild topology too and therefore fill **only** the two
+/// `gen_*` tables: every result face and edge is `Generated()` from a profile
+/// edge, which is what lets a caller trace geometry back to the sketch segment
+/// it grew from.
 #[derive(Clone, Default)]
 pub struct History {
 	/// Flat `[post_id, src_id]` face-derivation pairs (Modified/identity).
 	pub faces: Vec<u64>,
 	/// Flat `[post_id, src_id]` edge-derivation pairs (Modified/identity).
 	pub edges: Vec<u64>,
+	/// Flat `[gen_face_id, src_edge_id]` pairs for **Generated** faces — after
+	/// `extrude`/`revolve` the lateral face grown from a profile edge, plus the
+	/// cap faces under the reserved source `0` ("the profile as a whole").
+	/// Empty for ops without a `Generated()` face relation.
+	pub gen_faces: Vec<u64>,
 	/// Flat `[gen_edge_id, src_edge_id]` pairs for **Generated** edges — new edges
 	/// that no `Modified()` relation covers, mapped to the source edge that
 	/// spawned them (fillet/chamfer blend-boundary edges ← the filleted edge).
@@ -290,6 +295,10 @@ impl SolidStruct for Solid {
 		self.history.edges.chunks_exact(2).map(|c| [c[0], c[1]])
 	}
 
+	fn iter_generated_faces(&self) -> impl Iterator<Item = [u64; 2]> + '_ {
+		self.history.gen_faces.chunks_exact(2).map(|c| [c[0], c[1]])
+	}
+
 	fn iter_generated_edges(&self) -> impl Iterator<Item = [u64; 2]> + '_ {
 		self.history.gen_edges.chunks_exact(2).map(|c| [c[0], c[1]])
 	}
@@ -301,11 +310,12 @@ impl SolidStruct for Solid {
 		for e in profile {
 			ffi::edge_vec_push(profile_vec.pin_mut(), &e.inner);
 		}
-		// Nur `gen_edges`: extrude baut die Topologie komplett neu, es gibt
-		// also keine Modified()-Beziehung — jede Kante des Ergebnisses ist
-		// *generated* aus einem Profil-Kante (siehe `History::gen_edges`).
+		// Nur die `gen_*`-Tabellen: extrude baut die Topologie komplett neu, es
+		// gibt also keine Modified()-Beziehung — jede Fläche und jede Kante des
+		// Ergebnisses ist *generated* aus einer Profil-Kante (siehe
+		// `History::gen_faces` / `History::gen_edges`).
 		let mut history = History::default();
-		let shape = ffi::make_extrude(&profile_vec, dir.x, dir.y, dir.z, &mut history.gen_edges);
+		let shape = ffi::make_extrude(&profile_vec, dir.x, dir.y, dir.z, &mut history.gen_faces, &mut history.gen_edges);
 		if shape.is_null() {
 			return Err(Error::ExtrudeFailed);
 		}
@@ -324,9 +334,9 @@ impl SolidStruct for Solid {
 		for e in profile {
 			ffi::edge_vec_push(profile_vec.pin_mut(), &e.inner);
 		}
-		// Wie extrude: nur `gen_edges` (Topologie wird neu gebaut).
+		// Wie extrude: nur die `gen_*`-Tabellen (Topologie wird neu gebaut).
 		let mut history = History::default();
-		let shape = ffi::make_revolve(&profile_vec, axis_origin.x, axis_origin.y, axis_origin.z, axis_direction.x, axis_direction.y, axis_direction.z, angle, &mut history.gen_edges);
+		let shape = ffi::make_revolve(&profile_vec, axis_origin.x, axis_origin.y, axis_origin.z, axis_direction.x, axis_direction.y, axis_direction.z, angle, &mut history.gen_faces, &mut history.gen_edges);
 		if shape.is_null() {
 			return Err(Error::RevolveFailed);
 		}

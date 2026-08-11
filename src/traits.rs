@@ -544,6 +544,22 @@ pub trait SolidStruct: Sized + Clone + Transform {
 	/// a fully-filleted part's edges are nameable, and so a caller can trace an
 	/// edge back to the sketch segment that produced it.
 	fn iter_generated_edges(&self) -> impl Iterator<Item = [u64; 2]> + '_;
+	/// Iterate **Generated** face pairs `[gen_face, src_edge]` — the sharper half
+	/// of [`iter_generated_edges`](Self::iter_generated_edges): after
+	/// `extrude`/`revolve`, the lateral face grown from a profile edge. One
+	/// profile segment grows exactly ONE face but four edges, two of them shared
+	/// with its neighbours, so a name resolved on faces picks what the caller
+	/// meant where the same name on edges also picks the seams.
+	///
+	/// Cap faces (the profile face and its swept copy) appear under the reserved
+	/// source `0` — "the profile as a whole", since a cap is bounded by every
+	/// segment and belongs to none. Both caps usually share one id
+	/// (`subshape_id` ignores the location), so they can be told apart from
+	/// lateral faces by id but not from each other; separate top from bottom
+	/// geometrically. A full 360° revolution has no caps at all and reports only
+	/// its faces of revolution — an annulus swept by a radial profile edge
+	/// arrives without an entry.
+	fn iter_generated_faces(&self) -> impl Iterator<Item = [u64; 2]> + '_;
 
 	// --- Queries ---
 	/// Volume of the solid (uniform density).
