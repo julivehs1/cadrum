@@ -1,6 +1,6 @@
 use super::edge::Edge;
 use super::ffi;
-use crate::traits::FaceStruct;
+use crate::traits::{FaceStruct, Surface};
 use glam::DVec3;
 use std::sync::OnceLock;
 
@@ -36,6 +36,23 @@ impl FaceStruct for Face {
 		// well-formed face this is effectively unreachable.
 		assert!(ffi::face_project_point(&self.inner, p.x, p.y, p.z, &mut cpx, &mut cpy, &mut cpz, &mut nx, &mut ny, &mut nz), "Face::project: BRepExtrema_ExtPF failed (this is a bug)");
 		(DVec3::new(cpx, cpy, cpz), DVec3::new(nx, ny, nz))
+	}
+
+	fn surface(&self) -> Surface {
+		let (mut ox, mut oy, mut oz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut dx, mut dy, mut dz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let mut radius = 0.0_f64;
+		let kind = ffi::face_surface(&self.inner, &mut ox, &mut oy, &mut oz, &mut dx, &mut dy, &mut dz, &mut radius);
+		let (origin, dir) = (DVec3::new(ox, oy, oz), DVec3::new(dx, dy, dz));
+		match kind {
+			1 => Surface::Plane { origin, normal: dir },
+			2 => Surface::Cylinder { origin, axis: dir, radius },
+			_ => Surface::Other,
+		}
+	}
+
+	fn area(&self) -> f64 {
+		ffi::face_area(&self.inner)
 	}
 
 	fn iter_edge(&self) -> impl Iterator<Item = &Edge> + '_ {

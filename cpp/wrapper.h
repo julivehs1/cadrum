@@ -122,8 +122,9 @@ std::unique_ptr<TopoDS_Shape> deep_copy(const TopoDS_Shape& shape);
 // ==================== Builders (solid → solid with history) ====================
 //
 // Functions in this section take one or more solid inputs, rebuild topology,
-// and append flat [post_id, src_id, ...] face derivation pairs to
-// `out_history`. The Rust side stores these in `Solid::history`.
+// and append flat [post_id, src_id, ...] derivation pairs to `out_history`
+// (faces) and `out_edge_history` (edges). The Rust side stores these in
+// `Solid::history` (a `History { faces, edges }`).
 
 // Evaluate an arbitrary boolean expression on N solids in a single pass
 // using BOPAlgo_CellsBuilder. The expression is encoded as DIMACS-flat DNF:
@@ -136,40 +137,47 @@ std::unique_ptr<TopoDS_Shape> deep_copy(const TopoDS_Shape& shape);
 std::unique_ptr<TopoDS_Shape> builder_cells(
     const std::vector<TopoDS_Shape>& solids,
     rust::Slice<const int64_t> clauses,
-    rust::Vec<uint64_t>& out_history);
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history);
 
 // Unify shared faces / collinear edges via ShapeUpgrade_UnifySameDomain.
-// `out_history` encodes how each old face maps onto the unified result.
-// Rust uses it to remap the colormap when the `color` feature is enabled.
+// `out_history` / `out_edge_history` encode how each old face / edge maps onto
+// the unified result. Rust uses faces to remap the colormap (color feature).
 std::unique_ptr<TopoDS_Shape> builder_clean(
     const TopoDS_Shape& shape,
-    rust::Vec<uint64_t>& out_history);
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history);
 
 // Shell (hollow) the solid by removing `open_faces` and offsetting the
 // remaining faces by `thickness` via BRepOffsetAPI_MakeThickSolid. Negative
 // thickness hollows inward, positive thickens outward. Returns nullptr on
 // failure (e.g. self-intersecting offset at sharp corners).
 //
-// `out_history`: flat [post_id, src_id] face-derivation pairs (Modified(),
-// identity for pass-through). Generated walls have no face source, absent.
+// `out_history`/`out_edge_history`: flat [post_id, src_id] face/edge-derivation
+// pairs (Modified(), identity for pass-through). Generated walls have no
+// face/edge source, absent.
 std::unique_ptr<TopoDS_Shape> builder_thick_solid(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Face>& open_faces,
     double thickness,
-    rust::Vec<uint64_t>& out_history);
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history);
 
 // Fillet the given edges of `solid` with a uniform radius using
 // BRepFilletAPI_MakeFillet. Empty `edges` is a no-op (returns a shallow
 // copy of `solid`). Returns nullptr on OCCT failure (radius too large,
 // tangent discontinuity, edges not belonging to `solid`, etc.).
 //
-// `out_history`: flat [post_id, src_id] pairs (Modified(), identity for
-// untouched). Generated fillet arc faces come from edges, absent.
+// `out_history`/`out_edge_history`: flat [post_id, src_id] face/edge pairs
+// (Modified(), identity for untouched). `out_gen_edges`: flat [gen_edge, src_edge]
+// pairs for the new blend-boundary edges (Generated()) ← the filleted edge.
 std::unique_ptr<TopoDS_Shape> builder_fillet(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Edge>& edges,
     double radius,
-    rust::Vec<uint64_t>& out_history);
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_edges);
 
 // Chamfer (symmetric bevel) the given edges of `solid` with a uniform
 // distance using BRepFilletAPI_MakeChamfer. Empty `edges` is a no-op
@@ -177,13 +185,16 @@ std::unique_ptr<TopoDS_Shape> builder_fillet(
 // (distance too large, tangent discontinuity, edges not belonging to
 // `solid`, etc.).
 //
-// `out_history`: flat [post_id, src_id] pairs (Modified(), identity for
-// untouched). Generated chamfer faces come from edges, absent.
+// `out_history`/`out_edge_history`: flat [post_id, src_id] face/edge pairs
+// (Modified(), identity for untouched). `out_gen_edges`: flat [gen_edge, src_edge]
+// pairs for the new bevel-boundary edges (Generated()) ← the chamfered edge.
 std::unique_ptr<TopoDS_Shape> builder_chamfer(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Edge>& edges,
     double distance,
-    rust::Vec<uint64_t>& out_history);
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_edges);
 
 // ==================== Transforms (solid → solid, no history) ====================
 //
@@ -213,6 +224,7 @@ std::unique_ptr<TopoDS_Shape> transform_mirror(
 
 bool shape_is_null(const TopoDS_Shape& shape);
 bool shape_is_solid(const TopoDS_Shape& shape);
+bool shape_is_valid(const TopoDS_Shape& shape);
 double shape_volume(const TopoDS_Shape& shape);
 double shape_surface_area(const TopoDS_Shape& shape);
 void shape_center_of_mass(const TopoDS_Shape& shape,
@@ -355,9 +367,31 @@ std::unique_ptr<TopoDS_Edge> mirror_edge(
 
 // Extrude a closed profile wire into a solid using BRepPrimAPI_MakePrism.
 // Internally builds Wire → Face → Prism.
+//
+// `out_gen_edges`: flat [gen_edge, src_edge] pairs — every edge of the lateral
+// face grown from a profile edge, mapped back to that profile edge
+// (Generated()). This is where an edge name is BORN: the caller knows which
+// sketch segment each profile edge came from, so the resulting edges stay
+// pickable by origin instead of by geometric search. Bottom/top rim segments
+// and the two shared vertical edges all belong to their segment's lateral
+// face; a vertical edge legitimately appears under both neighbours.
 std::unique_ptr<TopoDS_Shape> make_extrude(
     const std::vector<TopoDS_Edge>& profile_edges,
-    double dx, double dy, double dz);
+    double dx, double dy, double dz,
+    rust::Vec<uint64_t>& out_gen_edges);
+
+// Revolve a closed profile wire around the axis (origin, direction) by
+// `angle` radians using BRepPrimAPI_MakeRevol. Internally builds
+// Wire → Face → Revol. The profile must not cross the axis.
+//
+// `out_gen_edges`: as in make_extrude — [gen_edge, src_edge] pairs from
+// Generated(), the birth of an edge name.
+std::unique_ptr<TopoDS_Shape> make_revolve(
+    const std::vector<TopoDS_Edge>& profile_edges,
+    double ox, double oy, double oz,
+    double dx, double dy, double dz,
+    double angle,
+    rust::Vec<uint64_t>& out_gen_edges);
 
 // Sweep a closed profile wire (built from `profile_edges`) along a spine
 // wire (built from `spine_edges`) using BRepOffsetAPI_MakePipeShell. The
@@ -439,6 +473,9 @@ std::unique_ptr<TopoDS_Shape> make_bspline_solid(
 // Both helpers return the underlying TopoDS_TShape* address as a u64 — used
 // to track face/solid/edge identity across boolean ops, color maps, and BREP I/O.
 uint64_t face_tshape_id(const TopoDS_Face& face);
+
+// Area of a single face in mm^2 (BRepGProp surface properties).
+double face_area(const TopoDS_Face& face);
 uint64_t shape_tshape_id(const TopoDS_Shape& shape);
 uint64_t edge_tshape_id(const TopoDS_Edge& edge);
 
@@ -451,6 +488,21 @@ bool face_project_point(const TopoDS_Face& face,
     double px, double py, double pz,
     double& cpx, double& cpy, double& cpz,
     double& nx, double& ny, double& nz);
+
+// Analytic surface behind `face`, for callers that need the *geometry* rather
+// than a sampled point: a hole's axis and radius, a seat's plane.
+//
+// Returns 0 = other (b-spline, cone, torus, …; out params untouched),
+// 1 = plane (`o` = a point on it, `d` = its normal, `radius` untouched),
+// 2 = cylinder (`o` = a point on the axis, `d` = axis direction, `radius` set).
+//
+// The plane normal is flipped for a REVERSED face, so it points out of the
+// material like `face_project_point`'s. A cylinder axis has no such
+// convention — the caller orients it.
+uint32_t face_surface(const TopoDS_Face& face,
+    double& ox, double& oy, double& oz,
+    double& dx, double& dy, double& dz,
+    double& radius);
 
 } // namespace cadrum
 

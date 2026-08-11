@@ -23,6 +23,7 @@
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Cylinder.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Trsf.hxx>
 #include <Geom_CylindricalSurface.hxx>
@@ -30,6 +31,7 @@
 #include <GC_MakeArcOfCircle.hxx>
 
 // --- BRep builders (faces / wires / edges / solid primitives) ---
+#include <BRepCheck_Analyzer.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepLib.hxx>
@@ -53,6 +55,7 @@
 #include <BRepPrimAPI_MakeHalfSpace.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
+#include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
 
 // --- Boolean operations & shape cleanup ---
@@ -115,6 +118,29 @@
 #include <array>
 
 namespace cadrum {
+
+// Identity of a sub-shape (face/edge/solid) as reported to Rust: the TShape
+// pointer, deliberately ignoring TopLoc_Location and Orientation.
+//
+// Ignoring orientation is plainly right — a reversed edge is the same edge.
+// Ignoring the location is a TRADE-OFF worth stating, because OCCT's own
+// `std::hash<TopoDS_Shape>` does mix it in:
+//
+//   * Ids must survive translate/rotate. Those ops only set a top-level
+//     TopLoc_Location, so mixing the location in would give every sub-shape a
+//     fresh id whenever a solid is moved — and both the colormap relay and
+//     caller-side provenance tables (edge names) key on ids across exactly such
+//     moves. Location-aware ids break them.
+//   * The price: a swept solid reuses one TShape for the bottom and the top
+//     copy of a profile edge, so those two edges share an id (a prism over a
+//     square reports 12 edges under 8 distinct ids). Harmless for provenance —
+//     an aliased pair always comes from the SAME profile edge, so it always
+//     carries the same name — but it means bottom and top rim cannot be told
+//     apart by id alone. Distinguish them geometrically (the caller's furthest/
+//     top/bottom filters), not by id.
+static inline uint64_t subshape_id(const TopoDS_Shape& s) {
+    return reinterpret_cast<uint64_t>(s.TShape().get());
+}
 
 // Forward declaration: STEP read post-process (defined further below near
 // decompose_into_solids). Used by both read_step_stream (this section) and
@@ -435,12 +461,11 @@ static TopoDS_Shape try_sew_orphan_faces(
     // 5. colormap キー remap (color path のみ)
     if (colorMap) {
         for (const auto& old_face : orphan_faces) {
-            uint64_t old_id = reinterpret_cast<uint64_t>(old_face.TShape().get());
+            uint64_t old_id = subshape_id(old_face);
             auto it = colorMap->find(old_id);
             if (it == colorMap->end()) continue;
             if (sewer.IsModified(old_face)) {
-                uint64_t new_id = reinterpret_cast<uint64_t>(
-                    sewer.Modified(old_face).TShape().get());
+                uint64_t new_id = subshape_id(sewer.Modified(old_face));
                 (*colorMap)[new_id] = it->second;
             }
         }
@@ -489,22 +514,25 @@ void compound_add(TopoDS_Shape& compound, const TopoDS_Shape& child) {
 
 // {result/pre → src}: Modified() empty ⇒ identity, else each split target → src.
 // Modified()/IsDeleted() are non-const, so Builder& (not const).
+// `kind` selects the sub-shape dimension (TopAbs_FACE for face history,
+// TopAbs_EDGE for edge history) — the relay logic is identical for both.
 template <typename Builder>
 static void relay_from_builder(
     Builder& builder,
     const TopoDS_Shape& src,
+    TopAbs_ShapeEnum kind,
     std::unordered_map<uint64_t, uint64_t>& relay)
 {
-    for (TopExp_Explorer ex(src, TopAbs_FACE); ex.More(); ex.Next()) {
+    for (TopExp_Explorer ex(src, kind); ex.More(); ex.Next()) {
         const TopoDS_Shape& sf = ex.Current();
-        uint64_t src_id = reinterpret_cast<uint64_t>(sf.TShape().get());
+        uint64_t src_id = subshape_id(sf);
         if (builder.IsDeleted(sf)) continue;
         const NCollection_List<TopoDS_Shape>& mods = builder.Modified(sf);
         if (mods.IsEmpty()) {
             relay[src_id] = src_id;
         } else {
             for (NCollection_List<TopoDS_Shape>::Iterator it(mods); it.More(); it.Next()) {
-                uint64_t pre_id = reinterpret_cast<uint64_t>(it.Value().TShape().get());
+                uint64_t pre_id = subshape_id(it.Value());
                 relay[pre_id] = src_id;
             }
         }
@@ -512,18 +540,20 @@ static void relay_from_builder(
 }
 
 // {post → pre} by index (BRepBuilderAPI_Copy preserves traversal order).
+// `kind` selects the sub-shape dimension (TopAbs_FACE / TopAbs_EDGE).
 static void relay_from_pair(
     const TopoDS_Shape& pre_shape,
     const TopoDS_Shape& post_shape,
+    TopAbs_ShapeEnum kind,
     std::unordered_map<uint64_t, uint64_t>& relay)
 {
     NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> pre_map, post_map;
-    TopExp::MapShapes(pre_shape, TopAbs_FACE, pre_map);
-    TopExp::MapShapes(post_shape, TopAbs_FACE, post_map);
+    TopExp::MapShapes(pre_shape, kind, pre_map);
+    TopExp::MapShapes(post_shape, kind, post_map);
     // pre_map and post_map have the same size because the copy preserves topology.
     for (int i = 1; i <= pre_map.Extent(); ++i) {
-        uint64_t pre_id = reinterpret_cast<uint64_t>(pre_map(i).TShape().get());
-        uint64_t post_id = reinterpret_cast<uint64_t>(post_map(i).TShape().get());
+        uint64_t pre_id = subshape_id(pre_map(i));
+        uint64_t post_id = subshape_id(post_map(i));
         relay[post_id] = pre_id;
     }
 }
@@ -550,12 +580,108 @@ static void relay_into_history(
     }
 }
 
+// Emit both face- and edge-derivation history for a no-copy builder
+// (fillet/chamfer/thick_solid): faces → out_faces, edges → out_edges, each a
+// flat [post_id, src_id] table built from Modified()/identity.
+template <typename Builder>
+static void emit_builder_history(
+    Builder& builder,
+    const TopoDS_Shape& src,
+    rust::Vec<uint64_t>& out_faces,
+    rust::Vec<uint64_t>& out_edges)
+{
+    std::unordered_map<uint64_t, uint64_t> rf, re;
+    relay_from_builder(builder, src, TopAbs_FACE, rf);
+    relay_from_builder(builder, src, TopAbs_EDGE, re);
+    relay_into_history(&rf, nullptr, out_faces);
+    relay_into_history(&re, nullptr, out_edges);
+}
+
+// Emit **Generated** edge pairs [gen_edge, src_edge] for a fillet/chamfer maker:
+// for each original edge, the maker's Generated() gives the blend face(s) it
+// spawned; every edge of those faces is "generated from" that original edge.
+// These are the brand-new blend-boundary edges that no Modified() relation
+// covers — the ones a fully-filleted part exposes to picking.
+template <typename Builder>
+static void emit_generated_edges(
+    Builder& builder,
+    const TopoDS_Shape& src,
+    rust::Vec<uint64_t>& out_gen_edges)
+{
+    for (TopExp_Explorer ex(src, TopAbs_EDGE); ex.More(); ex.Next()) {
+        const TopoDS_Shape& e = ex.Current();
+        uint64_t src_id = subshape_id(e);
+        const NCollection_List<TopoDS_Shape>& gen = builder.Generated(e);
+        for (NCollection_List<TopoDS_Shape>::Iterator it(gen); it.More(); it.Next()) {
+            for (TopExp_Explorer ge(it.Value(), TopAbs_EDGE); ge.More(); ge.Next()) {
+                uint64_t ge_id = subshape_id(ge.Current());
+                out_gen_edges.push_back(ge_id);
+                out_gen_edges.push_back(src_id);
+            }
+        }
+    }
+}
+
+// Emit **Generated** edge pairs [gen_edge, src_edge] for a sweep-style maker
+// (extrude/revolve) whose sources are the profile edges rather than sub-shapes
+// of an existing solid: Generated() gives the lateral face grown from each
+// profile edge, and every edge of that face is "generated from" it.
+//
+// This is the BIRTH of an edge name — extrude/revolve rebuild topology
+// wholesale, so without this table nothing in the result can be traced back to
+// the sketch segment it came from.
+//
+// `wire_edges[i]` is the edge that actually landed in the swept wire (see
+// BRepBuilderAPI_MakeWire::Edge — MakeWire rebuilds an edge when neighbours
+// must share vertices, so its TShape generally differs from the caller's input)
+// and `src_ids[i]` is the TShape id of the input edge it came from. The sweep
+// reports Generated() for the former; callers name the latter. Generated() is
+// keyed by the oriented shape, so an empty hit is retried reversed.
+template <typename Builder>
+static void emit_generated_from_profile(
+    Builder& builder,
+    const std::vector<TopoDS_Edge>& wire_edges,
+    const std::vector<uint64_t>& src_ids,
+    rust::Vec<uint64_t>& out_gen_edges)
+{
+    for (size_t i = 0; i < wire_edges.size() && i < src_ids.size(); ++i) {
+        const TopoDS_Edge& e = wire_edges[i];
+        if (e.IsNull()) continue;
+        // Copied, not referenced: Generated() hands back an internal member
+        // that the next call overwrites.
+        NCollection_List<TopoDS_Shape> gen = builder.Generated(e);
+        if (gen.IsEmpty()) gen = builder.Generated(e.Reversed());
+        for (NCollection_List<TopoDS_Shape>::Iterator it(gen); it.More(); it.Next()) {
+            for (TopExp_Explorer ge(it.Value(), TopAbs_EDGE); ge.More(); ge.Next()) {
+                out_gen_edges.push_back(subshape_id(ge.Current()));
+                out_gen_edges.push_back(src_ids[i]);
+            }
+        }
+    }
+}
+
+// Emit both face- and edge-derivation history for a copy-based no-op
+// (empty fillet/chamfer, sealed thick_solid, single-operand boolean fast path).
+static void emit_pair_history(
+    const TopoDS_Shape& pre_shape,
+    const TopoDS_Shape& post_shape,
+    rust::Vec<uint64_t>& out_faces,
+    rust::Vec<uint64_t>& out_edges)
+{
+    std::unordered_map<uint64_t, uint64_t> rf, re;
+    relay_from_pair(pre_shape, post_shape, TopAbs_FACE, rf);
+    relay_from_pair(pre_shape, post_shape, TopAbs_EDGE, re);
+    relay_into_history(&rf, nullptr, out_faces);
+    relay_into_history(&re, nullptr, out_edges);
+}
+
 // Evaluate any boolean expression in DNF on N solids via BOPAlgo_CellsBuilder.
 // 1 回の Perform() で全交差を計算し、clause ごとに AddToResult を呼ぶ。
 std::unique_ptr<TopoDS_Shape> builder_cells(
     const std::vector<TopoDS_Shape>& solids,
     rust::Slice<const int64_t> clauses,
-    rust::Vec<uint64_t>& out_history)
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history)
 {
     try {
         if (solids.empty() || clauses.size() == 0) return nullptr;
@@ -566,9 +692,7 @@ std::unique_ptr<TopoDS_Shape> builder_cells(
             BRepBuilderAPI_Copy copier(solids[0], true, false);
             auto shape = std::make_unique<TopoDS_Shape>(copier.Shape());
             // No builder: relay_from_pair gives {post → pre==src}; flatten it.
-            std::unordered_map<uint64_t, uint64_t> relay;
-            relay_from_pair(solids[0], copier.Shape(), relay);
-            relay_into_history(&relay, nullptr, out_history);
+            emit_pair_history(solids[0], copier.Shape(), out_history, out_edge_history);
             return shape;
         }
 
@@ -598,15 +722,19 @@ std::unique_ptr<TopoDS_Shape> builder_cells(
         }
         cb.RemoveInternalBoundaries();
 
-        std::unordered_map<uint64_t, uint64_t> relay1, relay2;
+        std::unordered_map<uint64_t, uint64_t> relay1, relay2;   // faces
+        std::unordered_map<uint64_t, uint64_t> relay1e, relay2e; // edges
         for (const auto& s : solids) {
-            relay_from_builder(cb, s, relay1);
+            relay_from_builder(cb, s, TopAbs_FACE, relay1);
+            relay_from_builder(cb, s, TopAbs_EDGE, relay1e);
         }
 
         BRepBuilderAPI_Copy copier(cb.Shape(), true, false);
         auto shape = std::make_unique<TopoDS_Shape>(copier.Shape());
-        relay_from_pair(cb.Shape(), copier.Shape(), relay2);
+        relay_from_pair(cb.Shape(), copier.Shape(), TopAbs_FACE, relay2);
+        relay_from_pair(cb.Shape(), copier.Shape(), TopAbs_EDGE, relay2e);
         relay_into_history(&relay1, &relay2, out_history);
+        relay_into_history(&relay1e, &relay2e, out_edge_history);
         return shape;
     } catch (const Standard_Failure&) {
         return nullptr;
@@ -619,7 +747,8 @@ std::unique_ptr<TopoDS_Shape> builder_cells(
 // `builder_boolean`'s history.
 std::unique_ptr<TopoDS_Shape> builder_clean(
     const TopoDS_Shape& shape,
-    rust::Vec<uint64_t>& out_history)
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history)
 {
     try {
         ShapeUpgrade_UnifySameDomain unifier(shape, true, true, true);
@@ -630,20 +759,27 @@ std::unique_ptr<TopoDS_Shape> builder_clean(
 
         Handle(BRepTools_History) history = unifier.History();
         if (!history.IsNull()) {
-            for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
-                const TopoDS_Shape& old_face = ex.Current();
-                uint64_t old_id = reinterpret_cast<uint64_t>(old_face.TShape().get());
-                if (history->IsRemoved(old_face)) continue;
-                const NCollection_List<TopoDS_Shape>& mods = history->Modified(old_face);
-                if (mods.IsEmpty()) {
-                    // Unchanged: TShape* is the same in the result.
-                    out_history.push_back(old_id);
-                    out_history.push_back(old_id);
-                } else {
-                    // Merged: use only the first resulting face (first-found wins).
-                    uint64_t new_id = reinterpret_cast<uint64_t>(mods.First().TShape().get());
-                    out_history.push_back(new_id);
-                    out_history.push_back(old_id);
+            // BRepTools_History::Modified/IsRemoved work identically for faces and
+            // edges, so the same walk emits both tables (clean merges collinear
+            // edges just as it merges coplanar faces).
+            const TopAbs_ShapeEnum kinds[2] = { TopAbs_FACE, TopAbs_EDGE };
+            rust::Vec<uint64_t>* outs[2] = { &out_history, &out_edge_history };
+            for (int k = 0; k < 2; ++k) {
+                for (TopExp_Explorer ex(shape, kinds[k]); ex.More(); ex.Next()) {
+                    const TopoDS_Shape& old_sub = ex.Current();
+                    uint64_t old_id = subshape_id(old_sub);
+                    if (history->IsRemoved(old_sub)) continue;
+                    const NCollection_List<TopoDS_Shape>& mods = history->Modified(old_sub);
+                    if (mods.IsEmpty()) {
+                        // Unchanged: TShape* is the same in the result.
+                        outs[k]->push_back(old_id);
+                        outs[k]->push_back(old_id);
+                    } else {
+                        // Merged: use only the first resulting sub-shape (first-found wins).
+                        uint64_t new_id = subshape_id(mods.First());
+                        outs[k]->push_back(new_id);
+                        outs[k]->push_back(old_id);
+                    }
                 }
             }
         }
@@ -717,6 +853,28 @@ bool shape_is_null(const TopoDS_Shape& shape) {
 
 bool shape_is_solid(const TopoDS_Shape& shape) {
     return !shape.IsNull() && shape.ShapeType() == TopAbs_SOLID;
+}
+
+// Is the shape topologically and geometrically sound?
+//
+// OCCT's modelling algorithms report success on results that are not: a
+// chamfer or boolean can hand back a solid with self-intersecting faces or
+// broken pcurves. Nothing shows until a later operation walks it, and then it
+// crashes far from the cause. BRepCheck_Analyzer is the only way to ask.
+//
+// A null shape is not valid — "nothing" is not a sound solid, and the caller
+// asking this question wants to know before using it.
+bool shape_is_valid(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) {
+        return false;
+    }
+    try {
+        BRepCheck_Analyzer analyzer(shape);
+        return analyzer.IsValid();
+    } catch (const Standard_Failure&) {
+        // The checker itself gave up — that is an answer too, and it is "no".
+        return false;
+    }
 }
 
 double shape_volume(const TopoDS_Shape& shape) {
@@ -840,7 +998,7 @@ MeshData mesh_shape(const TopoDS_Shape& shape, double linear, double angular, bo
         }
 
         // Indices
-        uint64_t face_id = reinterpret_cast<uint64_t>(face.TShape().get());
+        uint64_t face_id = subshape_id(face);
         for (int i = 1; i <= nb_triangles; i++) {
             const Poly_Triangle& tri = triangulation->Triangle(i);
 
@@ -919,15 +1077,21 @@ std::unique_ptr<TopoDS_Face> clone_face_handle(const TopoDS_Face& face) {
 // ==================== Face Methods ====================
 
 uint64_t face_tshape_id(const TopoDS_Face& face) {
-    return reinterpret_cast<uint64_t>(face.TShape().get());
+    return subshape_id(face);
+}
+
+double face_area(const TopoDS_Face& face) {
+    GProp_GProps props;
+    BRepGProp::SurfaceProperties(face, props);
+    return props.Mass();
 }
 
 uint64_t shape_tshape_id(const TopoDS_Shape& shape) {
-    return reinterpret_cast<uint64_t>(shape.TShape().get());
+    return subshape_id(shape);
 }
 
 uint64_t edge_tshape_id(const TopoDS_Edge& edge) {
-    return reinterpret_cast<uint64_t>(edge.TShape().get());
+    return subshape_id(edge);
 }
 
 bool face_project_point(const TopoDS_Face& face,
@@ -982,6 +1146,55 @@ bool face_project_point(const TopoDS_Face& face,
         return true;
     } catch (const Standard_Failure&) {
         return false;
+    }
+}
+
+uint32_t face_surface(const TopoDS_Face& face,
+    double& ox, double& oy, double& oz,
+    double& dx, double& dy, double& dz,
+    double& radius)
+{
+    try {
+        // BRepAdaptor_Surface resolves the face's location, so these values
+        // come back in world space — a hole in a moved solid reports the
+        // moved axis, not the one its primitive was built with.
+        BRepAdaptor_Surface surf(face);
+        gp_Pnt o;
+        gp_Dir d;
+        uint32_t kind;
+
+        switch (surf.GetType()) {
+        case GeomAbs_Plane: {
+            const gp_Pln pln = surf.Plane();
+            o = pln.Location();
+            d = pln.Axis().Direction();
+            // Same convention as face_project_point: outward, not
+            // surface-parametric.
+            if (face.Orientation() == TopAbs_REVERSED) d.Reverse();
+            kind = 1;
+            break;
+        }
+        case GeomAbs_Cylinder: {
+            const gp_Cylinder cyl = surf.Cylinder();
+            o = cyl.Location();
+            d = cyl.Axis().Direction();
+            radius = cyl.Radius();
+            kind = 2;
+            break;
+        }
+        default:
+            return 0;
+        }
+
+        ox = o.X();
+        oy = o.Y();
+        oz = o.Z();
+        dx = d.X();
+        dy = d.Y();
+        dz = d.Z();
+        return kind;
+    } catch (const Standard_Failure&) {
+        return 0;
     }
 }
 
@@ -1394,7 +1607,8 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Face>& open_faces,
     double thickness,
-    rust::Vec<uint64_t>& out_history)
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history)
 {
     try {
         // Empty open_faces: MakeThickSolidByJoin degenerates to a plain offset
@@ -1434,11 +1648,9 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
             BRepBuilderAPI_MakeSolid solid_maker(outer);
             solid_maker.Add(TopoDS::Shell(inner.Reversed()));
             if (!solid_maker.IsDone()) return nullptr;
-            // Sealed case: original faces are retained as identity; offset walls
-            // are Generated (src is an edge) and intentionally absent.
-            std::unordered_map<uint64_t, uint64_t> relay;
-            relay_from_pair(solid, solid, relay);
-            relay_into_history(&relay, nullptr, out_history);
+            // Sealed case: original faces/edges are retained as identity; offset
+            // walls are Generated (src is an edge) and intentionally absent.
+            emit_pair_history(solid, solid, out_history, out_edge_history);
             return std::make_unique<TopoDS_Shape>(solid_maker.Solid());
         }
 
@@ -1457,17 +1669,24 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
         if (!builder.IsDone()) return nullptr;
         // No copy, so relay keys are final faces.
         std::unordered_map<uint64_t, uint64_t> relay;
-        relay_from_builder(builder, solid, relay);
+        relay_from_builder(builder, solid, TopAbs_FACE, relay);
         // MakeThickSolid does not flag removed open faces as IsDeleted; drop
         // their (identity) pairs since those faces are absent from the result.
         for (const auto& f : open_faces) {
-            uint64_t removed_id = reinterpret_cast<uint64_t>(f.TShape().get());
+            uint64_t removed_id = subshape_id(f);
             for (auto it = relay.begin(); it != relay.end(); ) {
                 if (it->second == removed_id) it = relay.erase(it);
                 else ++it;
             }
         }
         relay_into_history(&relay, nullptr, out_history);
+        // Edge history: emit the Modified()/identity relay directly. Edges of a
+        // removed open face are usually shared with a retained adjacent face and
+        // survive, so the face-specific erase above does not apply; over-inclusion
+        // is harmless because consumers filter by src-edge membership.
+        std::unordered_map<uint64_t, uint64_t> relay_e;
+        relay_from_builder(builder, solid, TopAbs_EDGE, relay_e);
+        relay_into_history(&relay_e, nullptr, out_edge_history);
         return std::make_unique<TopoDS_Shape>(builder.Shape());
     } catch (const Standard_Failure&) {
         return nullptr;
@@ -1478,14 +1697,14 @@ std::unique_ptr<TopoDS_Shape> builder_fillet(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Edge>& edges,
     double radius,
-    rust::Vec<uint64_t>& out_history)
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_edges)
 {
     try {
         if (edges.empty()) {
-            // No-op: shallow copy; every face is identity.
-            std::unordered_map<uint64_t, uint64_t> relay;
-            relay_from_pair(solid, solid, relay);
-            relay_into_history(&relay, nullptr, out_history);
+            // No-op: shallow copy; every face/edge is identity.
+            emit_pair_history(solid, solid, out_history, out_edge_history);
             return std::make_unique<TopoDS_Shape>(solid);
         }
         BRepFilletAPI_MakeFillet mk(solid);
@@ -1504,10 +1723,10 @@ std::unique_ptr<TopoDS_Shape> builder_fillet(
             if (!ex.More()) return nullptr;
             result = ex.Current();
         }
-        // No copy, so relay keys are final faces (identity for untouched).
-        std::unordered_map<uint64_t, uint64_t> relay;
-        relay_from_builder(mk, solid, relay);
-        relay_into_history(&relay, nullptr, out_history);
+        // No copy, so relay keys are final faces/edges (identity for untouched).
+        emit_builder_history(mk, solid, out_history, out_edge_history);
+        // Blend-boundary edges (the new ones a filleted part exposes) → source edge.
+        emit_generated_edges(mk, solid, out_gen_edges);
         return std::make_unique<TopoDS_Shape>(result);
     } catch (const Standard_Failure&) {
         return nullptr;
@@ -1518,14 +1737,14 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Edge>& edges,
     double distance,
-    rust::Vec<uint64_t>& out_history)
+    rust::Vec<uint64_t>& out_history,
+    rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_edges)
 {
     try {
         if (edges.empty()) {
-            // No-op: shallow copy; every face is identity.
-            std::unordered_map<uint64_t, uint64_t> relay;
-            relay_from_pair(solid, solid, relay);
-            relay_into_history(&relay, nullptr, out_history);
+            // No-op: shallow copy; every face/edge is identity.
+            emit_pair_history(solid, solid, out_history, out_edge_history);
             return std::make_unique<TopoDS_Shape>(solid);
         }
         BRepFilletAPI_MakeChamfer mk(solid);
@@ -1544,10 +1763,10 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
             if (!ex.More()) return nullptr;
             result = ex.Current();
         }
-        // No copy, so relay keys are final faces (identity for untouched).
-        std::unordered_map<uint64_t, uint64_t> relay;
-        relay_from_builder(mk, solid, relay);
-        relay_into_history(&relay, nullptr, out_history);
+        // No copy, so relay keys are final faces/edges (identity for untouched).
+        emit_builder_history(mk, solid, out_history, out_edge_history);
+        // Chamfer bevel-boundary edges (new) → source edge.
+        emit_generated_edges(mk, solid, out_gen_edges);
         return std::make_unique<TopoDS_Shape>(result);
     } catch (const Standard_Failure&) {
         return nullptr;
@@ -1556,21 +1775,60 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
 
 // Extrude a closed profile wire into a solid via BRepPrimAPI_MakePrism.
 // Edges → Wire → Face → Prism (solid).
-std::unique_ptr<TopoDS_Shape> make_extrude(
+std::unique_ptr<TopoDS_Shape> make_revolve(
     const std::vector<TopoDS_Edge>& profile_edges,
-    double dx, double dy, double dz)
+    double ox, double oy, double oz,
+    double dx, double dy, double dz,
+    double angle,
+    rust::Vec<uint64_t>& out_gen_edges)
 {
     try {
         if (profile_edges.empty()) return nullptr;
         BRepBuilderAPI_MakeWire wire_maker;
-        for (const auto& e : profile_edges) wire_maker.Add(e);
-        if (!wire_maker.IsDone()) return nullptr;
+        std::vector<TopoDS_Edge> wire_edges;
+        std::vector<uint64_t> src_ids;
+        for (const auto& e : profile_edges) {
+            wire_maker.Add(e);
+            if (!wire_maker.IsDone()) return nullptr;
+            wire_edges.push_back(wire_maker.Edge());
+            src_ids.push_back(subshape_id(e));
+        }
+        BRepBuilderAPI_MakeFace face_maker(wire_maker.Wire());
+        if (!face_maker.IsDone()) return nullptr;
+        gp_Ax1 axis(gp_Pnt(ox, oy, oz), gp_Dir(dx, dy, dz));
+        BRepPrimAPI_MakeRevol revol(face_maker.Face(), axis, angle);
+        revol.Build();
+        if (!revol.IsDone()) return nullptr;
+        emit_generated_from_profile(revol, wire_edges, src_ids, out_gen_edges);
+        return std::make_unique<TopoDS_Shape>(revol.Shape());
+    } catch (const Standard_Failure&) {
+        return nullptr;
+    }
+}
+
+std::unique_ptr<TopoDS_Shape> make_extrude(
+    const std::vector<TopoDS_Edge>& profile_edges,
+    double dx, double dy, double dz,
+    rust::Vec<uint64_t>& out_gen_edges)
+{
+    try {
+        if (profile_edges.empty()) return nullptr;
+        BRepBuilderAPI_MakeWire wire_maker;
+        std::vector<TopoDS_Edge> wire_edges;
+        std::vector<uint64_t> src_ids;
+        for (const auto& e : profile_edges) {
+            wire_maker.Add(e);
+            if (!wire_maker.IsDone()) return nullptr;
+            wire_edges.push_back(wire_maker.Edge());
+            src_ids.push_back(subshape_id(e));
+        }
         BRepBuilderAPI_MakeFace face_maker(wire_maker.Wire());
         if (!face_maker.IsDone()) return nullptr;
         gp_Vec dir(dx, dy, dz);
         BRepPrimAPI_MakePrism prism(face_maker.Face(), dir);
         prism.Build();
         if (!prism.IsDone()) return nullptr;
+        emit_generated_from_profile(prism, wire_edges, src_ids, out_gen_edges);
         return std::make_unique<TopoDS_Shape>(prism.Shape());
     } catch (const Standard_Failure&) {
         return nullptr;
@@ -2043,13 +2301,13 @@ static void collect_colors(
         if (colorTool->GetColor(label, XCAFDoc_ColorSurf, color) ||
             colorTool->GetColor(label, XCAFDoc_ColorGen, color)) {
             if (s.ShapeType() == TopAbs_FACE) {
-                colorMap[reinterpret_cast<uint64_t>(s.TShape().get())] = {
+                colorMap[subshape_id(s)] = {
                     (float)color.Red(), (float)color.Green(), (float)color.Blue()};
             } else {
                 // A label's shape may be a COMPOUND/COMPSOLID — an assembly, or a
                 // product of several bodies — which is a level STEP often styles.
                 for (TopExp_Explorer ex(s, TopAbs_SOLID); ex.More(); ex.Next()) {
-                    colorMap[reinterpret_cast<uint64_t>(ex.Current().TShape().get())] = {
+                    colorMap[subshape_id(ex.Current())] = {
                         (float)color.Red(), (float)color.Green(), (float)color.Blue()};
                 }
             }
@@ -2106,7 +2364,7 @@ std::unique_ptr<TopoDS_Shape> read_step_color_stream(
         // Walk the POST-processed shape so sewing's new TShape* are picked up, and
         // entries it no longer holds are dropped by not being reached.
         auto emit = [&](const TopoDS_Shape& sub) {
-            uint64_t id = reinterpret_cast<uint64_t>(sub.TShape().get());
+            uint64_t id = subshape_id(sub);
             auto it = colorMap.find(id);
             if (it == colorMap.end()) return;
             out_ids.push_back(id);
@@ -2165,7 +2423,7 @@ bool write_step_color_stream(
         for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) {
             const TopoDS_Shape& solid = ex.Current();
             auto it = colorLookup.find(
-                reinterpret_cast<uint64_t>(solid.TShape().get()));
+                subshape_id(solid));
             if (it == colorLookup.end()) continue;
             set_color(solid, it->second);
         }
@@ -2173,7 +2431,7 @@ bool write_step_color_stream(
         for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
             const TopoDS_Shape& face = ex.Current();
             auto it = colorLookup.find(
-                reinterpret_cast<uint64_t>(face.TShape().get()));
+                subshape_id(face));
             if (it == colorLookup.end()) continue;
             set_color(face, it->second);
         }

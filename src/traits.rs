@@ -444,6 +444,44 @@ pub trait FaceStruct: Sized {
 	/// Use with `Edge::id()` to test face/edge incidence:
 	/// `face.iter_edge().any(|e| e.id() == edge.id())`.
 	fn iter_edge(&self) -> impl Iterator<Item = &Self::Edge> + '_;
+
+	/// The analytic surface this face lies on, in world coordinates — for
+	/// callers that need the *geometry* rather than a sampled point: a hole's
+	/// axis and radius, a mounting face's plane. Anything that is neither
+	/// plane nor cylinder reports [`Surface::Other`]; `project` still works
+	/// there.
+	fn surface(&self) -> Surface;
+
+	/// Area of this face in mm^2, respecting its trim.
+	///
+	/// Sister of `Solid::area`, which sums the whole boundary. A caller
+	/// picking a mounting face out of an imported part needs the individual
+	/// values: direction alone does not separate a seating face from the
+	/// chamfer and fillet remnants that happen to point the same way.
+	fn area(&self) -> f64;
+}
+
+/// The analytic surface behind a `Face` (see `Face::surface`).
+///
+/// Deliberately only the two kinds that carry a usable frame for assembly
+/// work. Cones, tori and b-splines are `Other` rather than a growing set of
+/// variants nobody matches on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Surface {
+	/// `normal` points out of the material, like `Face::project`'s.
+	Plane {
+		origin: DVec3,
+		normal: DVec3,
+	},
+	/// `origin` is a point on the axis — not a face boundary. The axis
+	/// direction carries no inside/outside convention; orient it at the
+	/// call site.
+	Cylinder {
+		origin: DVec3,
+		axis: DVec3,
+		radius: f64,
+	},
+	Other,
 }
 
 /// Backend-independent solid trait (pub(crate) — not exposed to users).
@@ -492,9 +530,33 @@ pub trait SolidStruct: Sized + Clone + Transform {
 	/// it stays through translate/rotate/color). Empty after primitive/builder
 	/// construction, I/O read, scale/mirror, or Clone.
 	fn iter_history(&self) -> impl Iterator<Item = [u64; 2]> + '_;
+	/// Iterate edge-derivation pairs `[post_id, src_id]` — the edge-level
+	/// analogue of [`iter_history`](Self::iter_history), covering boolean /
+	/// clean / shell / fillet / chamfer. `post_id`/`src_id` are edge TShape*
+	/// ids (compare against `iter_edge().map(|e| e.id())`). Modified()/identity
+	/// only; brand-new Generated() edges (fillet/chamfer/section) have no entry.
+	fn iter_edge_history(&self) -> impl Iterator<Item = [u64; 2]> + '_;
+	/// Iterate **Generated** edge pairs `[gen_edge, src_edge]` — brand-new edges
+	/// mapped to the source edge that spawned them: fillet/chamfer blend
+	/// boundaries ← the rounded edge, and after `extrude`/`revolve` every result
+	/// edge ← the **profile edge** it grew from. Complements
+	/// [`iter_edge_history`](Self::iter_edge_history) (Modified/identity only) so
+	/// a fully-filleted part's edges are nameable, and so a caller can trace an
+	/// edge back to the sketch segment that produced it.
+	fn iter_generated_edges(&self) -> impl Iterator<Item = [u64; 2]> + '_;
 
 	// --- Queries ---
 	/// Volume of the solid (uniform density).
+	/// **Is this solid sound?** — topology and geometry checked
+	/// (`BRepCheck_Analyzer`).
+	///
+	/// The question exists because the modelling algorithms lie: a chamfer or
+	/// a boolean can return `Ok` with a solid whose faces intersect
+	/// themselves. Nothing complains until a later operation walks it, and
+	/// that crash names the wrong culprit. Whoever builds on a result they did
+	/// not author should ask.
+	fn is_valid(&self) -> bool;
+
 	fn volume(&self) -> f64;
 	/// Total surface area of the solid.
 	fn area(&self) -> f64;
@@ -526,6 +588,18 @@ pub trait SolidStruct: Sized + Clone + Transform {
 	/// Internally builds a face from the wire and uses `BRepPrimAPI_MakePrism`.
 	/// Fails if the profile is empty, not closed, or the direction is zero-length.
 	fn extrude<'a>(profile: impl IntoIterator<Item = &'a Self::Edge>, dir: DVec3) -> Result<Self, Error>
+	where
+		Self::Edge: 'a;
+
+	/// Revolve a closed profile wire around the axis through `axis_origin`
+	/// with direction `axis_direction`, by `angle` radians (`TAU` for a full
+	/// revolution). Wraps `BRepPrimAPI_MakeRevol` (Wire → Face → Revol).
+	///
+	/// The profile must lie in a plane containing the axis and must not
+	/// cross it (touching is fine — OCCT degenerates the seam cleanly).
+	/// Fails with `Error::RevolveFailed` on an open profile, a zero-length
+	/// axis, or OCCT rejection.
+	fn revolve<'a>(profile: impl IntoIterator<Item = &'a Self::Edge>, axis_origin: DVec3, axis_direction: DVec3, angle: f64) -> Result<Self, Error>
 	where
 		Self::Edge: 'a;
 

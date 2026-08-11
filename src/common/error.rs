@@ -34,6 +34,7 @@ pub enum Error {
 	/// Extrusion (`Solid::extrude`) failed: empty profile, zero-length
 	/// direction, or profile not closed.
 	ExtrudeFailed,
+	RevolveFailed,
 
 	/// Pipe sweep (`Solid::sweep`) failed: profile not closed, edges not
 	/// connectable into a wire, or `BRepOffsetAPI_MakePipe` returned no shape.
@@ -113,6 +114,7 @@ impl std::fmt::Display for Error {
 			Error::CleanFailed => write!(f, "Shape clean failed"),
 			Error::HelixFailed => write!(f, "Helix failed"),
 			Error::ExtrudeFailed => write!(f, "Extrude failed"),
+			Error::RevolveFailed => write!(f, "Revolve failed"),
 			Error::SweepFailed => write!(f, "Sweep failed"),
 			Error::ShellFailed => write!(f, "Shell failed"),
 			Error::FilletFailed => write!(f, "Fillet failed"),

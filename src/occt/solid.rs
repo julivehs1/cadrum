@@ -51,6 +51,35 @@ fn remap_colormap_by_order(old_inner: &ffi::TopoDS_Shape, new_inner: &ffi::TopoD
 	colormap
 }
 
+/// Sub-shape derivation history from the most recent history-producing
+/// operation (boolean / clean / shell / fillet / chamfer).
+///
+/// Both `faces` and `edges` are flat `[post_id, src_id, ...]` pairs of TShape*
+/// ids (see [`SolidStruct::iter_history`] / [`SolidStruct::iter_edge_history`]):
+/// `post_id` identifies a face/edge in the result solid, `src_id` the
+/// originating face/edge in an operand. Modified()/identity only — brand-new
+/// `Generated()` faces (fillet arcs, section faces) and their edges have no
+/// entry. Empty for primitives and builders that rebuild topology wholesale
+/// (sweep/loft/bspline/scale/mirror/Clone). Preserved across
+/// translate/rotate/color (TShape* unchanged).
+///
+/// extrude/revolve rebuild topology too and therefore fill **only**
+/// `gen_edges`: every result edge is `Generated()` from a profile edge, which
+/// is what lets a caller trace geometry back to the sketch segment it grew
+/// from.
+#[derive(Clone, Default)]
+pub struct History {
+	/// Flat `[post_id, src_id]` face-derivation pairs (Modified/identity).
+	pub faces: Vec<u64>,
+	/// Flat `[post_id, src_id]` edge-derivation pairs (Modified/identity).
+	pub edges: Vec<u64>,
+	/// Flat `[gen_edge_id, src_edge_id]` pairs for **Generated** edges — new edges
+	/// that no `Modified()` relation covers, mapped to the source edge that
+	/// spawned them (fillet/chamfer blend-boundary edges ← the filleted edge).
+	/// Empty for ops without a `Generated()` edge relation.
+	pub gen_edges: Vec<u64>,
+}
+
 /// A single solid topology shape wrapping a `TopoDS_Shape` guaranteed to be `TopAbs_SOLID`.
 ///
 /// `inner` is private to prevent external mutation that could break the solid invariant.
@@ -69,20 +98,12 @@ pub struct Solid {
 	/// colour wins over the solid's. Other solids' keys may be present (`decompose`).
 	#[cfg(feature = "color")]
 	colormap: std::collections::HashMap<u64, crate::common::color::Color>,
-	/// Face-derivation history from the most recent boolean operation.
-	///
-	/// Flat `[post_id, src_id, post_id, src_id, ...]` pairs:
-	/// - `post_id` is the TShape* of a face in this Solid (or, after
-	///   decompose, possibly in a sibling result Solid — over-inclusion
-	///   is harmless because consumers filter by `src_id`).
-	/// - `src_id` is the TShape* of the originating face in either
-	///   boolean input (a or b — distinction is intentionally lost;
-	///   TShape* is globally unique so callers filter by membership).
-	///
-	/// Empty for primitives, builders (extrude/sweep/loft/bspline/shell/
-	/// fillet/chamfer), I/O reads, and after scale/mirror/Clone (which
-	/// rebuild topology). Preserved across translate/rotate/color.
-	history: Vec<u64>,
+	/// Face- and edge-derivation history from the most recent history-producing
+	/// operation. See [`History`]. `post_id`s may (after decompose) belong to a
+	/// sibling result Solid — over-inclusion is harmless because consumers filter
+	/// by `src_id` membership. Preserved across translate/rotate/color; dropped by
+	/// scale/mirror/Clone (which rebuild topology).
+	history: History,
 }
 
 impl Solid {
@@ -90,7 +111,7 @@ impl Solid {
 	///
 	/// # Panics
 	/// Panics if `inner` is not `TopAbs_SOLID` (and not null).
-	pub(crate) fn new(inner: cxx::UniquePtr<ffi::TopoDS_Shape>, #[cfg(feature = "color")] colormap: std::collections::HashMap<u64, crate::common::color::Color>, history: Vec<u64>) -> Self {
+	pub(crate) fn new(inner: cxx::UniquePtr<ffi::TopoDS_Shape>, #[cfg(feature = "color")] colormap: std::collections::HashMap<u64, crate::common::color::Color>, history: History) -> Self {
 		debug_assert!(ffi::shape_is_null(&inner) || ffi::shape_is_solid(&inner), "Solid::new called with a non-SOLID shape");
 		Solid {
 			inner,
@@ -126,8 +147,8 @@ impl Solid {
 	/// Carry face colours across `history` `[post_id, src_id]` pairs, and the solid's
 	/// own colour onto the new solid (shell/fillet/chamfer/clean).
 	#[cfg(feature = "color")]
-	fn remap_colormap(&self, new_inner: &ffi::TopoDS_Shape, history: &[u64]) -> std::collections::HashMap<u64, crate::common::color::Color> {
-		let mut colormap: std::collections::HashMap<u64, crate::common::color::Color> = history.chunks_exact(2).filter_map(|p| Some((p[0], *self.colormap.get(&p[1])?))).collect();
+	fn remap_colormap(&self, new_inner: &ffi::TopoDS_Shape, history: &History) -> std::collections::HashMap<u64, crate::common::color::Color> {
+		let mut colormap: std::collections::HashMap<u64, crate::common::color::Color> = history.faces.chunks_exact(2).filter_map(|p| Some((p[0], *self.colormap.get(&p[1])?))).collect();
 		// `history` is a face→face relation and has no entry for the solid, whose
 		// TShape id these ops change. Carry it across by hand.
 		if let Some(&color) = self.colormap.get(&ffi::shape_tshape_id(&self.inner)) {
@@ -141,6 +162,25 @@ impl Solid {
 	/// Returns `true` if this solid wraps a null shape.
 	pub fn is_null(&self) -> bool {
 		ffi::shape_is_null(&self.inner)
+	}
+
+	/// **Shallow copy** sharing the underlying OCCT `TShape` — unlike [`Clone`],
+	/// which deep-copies (`BRepBuilderAPI_Copy`) and rebuilds topology with fresh
+	/// TShape ids. Face/edge [`id`](crate::Edge::id)s, the colormap, and the
+	/// [`History`] are all preserved, so provenance / history matching survives
+	/// the copy. Safe because a `Solid` is immutable (every op consumes `self`
+	/// and yields a new `Solid`); this is exactly the handle-sharing
+	/// [`boolean`](SolidStruct::boolean) already relies on so operand ids stay
+	/// matchable against a result's history.
+	pub fn share(&self) -> Solid {
+		Solid {
+			inner: ffi::clone_shape_handle(&self.inner),
+			edges: OnceLock::new(),
+			faces: OnceLock::new(),
+			#[cfg(feature = "color")]
+			colormap: self.colormap.clone(),
+			history: self.history.clone(),
+		}
 	}
 }
 
@@ -243,7 +283,15 @@ impl SolidStruct for Solid {
 	}
 
 	fn iter_history(&self) -> impl Iterator<Item = [u64; 2]> + '_ {
-		self.history.chunks_exact(2).map(|c| [c[0], c[1]])
+		self.history.faces.chunks_exact(2).map(|c| [c[0], c[1]])
+	}
+
+	fn iter_edge_history(&self) -> impl Iterator<Item = [u64; 2]> + '_ {
+		self.history.edges.chunks_exact(2).map(|c| [c[0], c[1]])
+	}
+
+	fn iter_generated_edges(&self) -> impl Iterator<Item = [u64; 2]> + '_ {
+		self.history.gen_edges.chunks_exact(2).map(|c| [c[0], c[1]])
 	}
 
 	// ==================== Extrude ====================
@@ -253,7 +301,11 @@ impl SolidStruct for Solid {
 		for e in profile {
 			ffi::edge_vec_push(profile_vec.pin_mut(), &e.inner);
 		}
-		let shape = ffi::make_extrude(&profile_vec, dir.x, dir.y, dir.z);
+		// Nur `gen_edges`: extrude baut die Topologie komplett neu, es gibt
+		// also keine Modified()-Beziehung — jede Kante des Ergebnisses ist
+		// *generated* aus einem Profil-Kante (siehe `History::gen_edges`).
+		let mut history = History::default();
+		let shape = ffi::make_extrude(&profile_vec, dir.x, dir.y, dir.z, &mut history.gen_edges);
 		if shape.is_null() {
 			return Err(Error::ExtrudeFailed);
 		}
@@ -261,7 +313,28 @@ impl SolidStruct for Solid {
 			shape,
 			#[cfg(feature = "color")]
 			std::collections::HashMap::new(),
-			Default::default(),
+			history,
+		))
+	}
+
+	// ==================== Revolve ====================
+
+	fn revolve<'a>(profile: impl IntoIterator<Item = &'a Edge>, axis_origin: DVec3, axis_direction: DVec3, angle: f64) -> Result<Self, Error> {
+		let mut profile_vec = ffi::edge_vec_new();
+		for e in profile {
+			ffi::edge_vec_push(profile_vec.pin_mut(), &e.inner);
+		}
+		// Wie extrude: nur `gen_edges` (Topologie wird neu gebaut).
+		let mut history = History::default();
+		let shape = ffi::make_revolve(&profile_vec, axis_origin.x, axis_origin.y, axis_origin.z, axis_direction.x, axis_direction.y, axis_direction.z, angle, &mut history.gen_edges);
+		if shape.is_null() {
+			return Err(Error::RevolveFailed);
+		}
+		Ok(Solid::new(
+			shape,
+			#[cfg(feature = "color")]
+			std::collections::HashMap::new(),
+			history,
 		))
 	}
 
@@ -272,8 +345,8 @@ impl SolidStruct for Solid {
 		for f in open_faces {
 			ffi::face_vec_push(face_vec.pin_mut(), &f.inner);
 		}
-		let mut history: Vec<u64> = Default::default();
-		let shape = ffi::builder_thick_solid(&self.inner, &face_vec, thickness, &mut history);
+		let mut history = History::default();
+		let shape = ffi::builder_thick_solid(&self.inner, &face_vec, thickness, &mut history.faces, &mut history.edges);
 		if shape.is_null() {
 			return Err(Error::ShellFailed);
 		}
@@ -294,8 +367,8 @@ impl SolidStruct for Solid {
 		for e in edges {
 			ffi::edge_vec_push(edge_vec.pin_mut(), &e.inner);
 		}
-		let mut history: Vec<u64> = Default::default();
-		let shape = ffi::builder_fillet(&self.inner, &edge_vec, radius, &mut history);
+		let mut history = History::default();
+		let shape = ffi::builder_fillet(&self.inner, &edge_vec, radius, &mut history.faces, &mut history.edges, &mut history.gen_edges);
 		if shape.is_null() {
 			return Err(Error::FilletFailed);
 		}
@@ -314,8 +387,8 @@ impl SolidStruct for Solid {
 		for e in edges {
 			ffi::edge_vec_push(edge_vec.pin_mut(), &e.inner);
 		}
-		let mut history: Vec<u64> = Default::default();
-		let shape = ffi::builder_chamfer(&self.inner, &edge_vec, distance, &mut history);
+		let mut history = History::default();
+		let shape = ffi::builder_chamfer(&self.inner, &edge_vec, distance, &mut history.faces, &mut history.edges, &mut history.gen_edges);
 		if shape.is_null() {
 			return Err(Error::ChamferFailed);
 		}
@@ -481,8 +554,8 @@ impl SolidStruct for Solid {
 	// ==================== Clean ====================
 
 	fn clean(&self) -> Result<Self, Error> {
-		let mut history: Vec<u64> = Default::default();
-		let inner = ffi::builder_clean(&self.inner, &mut history);
+		let mut history = History::default();
+		let inner = ffi::builder_clean(&self.inner, &mut history.faces, &mut history.edges);
 		if inner.is_null() {
 			return Err(Error::CleanFailed);
 		}
@@ -502,21 +575,10 @@ impl SolidStruct for Solid {
 	where
 		Self: 'a,
 	{
-		// TShape* を共有する shallow copy で Boolean を組む。Solid::clone() (=
-		// BRepBuilderAPI_Copy) と違い、各 face の id() が元と一致するため
-		// boolean 結果の history (post_id, src_id) を呼び出し側の face id と
-		// 照合できる。
-		let solids: Vec<Solid> = solids
-			.into_iter()
-			.map(|s| Solid {
-				inner: ffi::clone_shape_handle(&s.inner),
-				edges: OnceLock::new(),
-				faces: OnceLock::new(),
-				#[cfg(feature = "color")]
-				colormap: s.colormap.clone(),
-				history: s.history.clone(),
-			})
-			.collect();
+		// TShape* を共有する shallow copy (`share`) で Boolean を組む。Solid::clone()
+		// (= BRepBuilderAPI_Copy) と違い、各 face の id() が元と一致するため boolean
+		// 結果の history (post_id, src_id) を呼び出し側の face id と照合できる。
+		let solids: Vec<Solid> = solids.into_iter().map(Solid::share).collect();
 		Boolean::from_parts(solids, clauses.into_iter().collect())
 	}
 	fn boolean_build(b: &Boolean<Self>) -> Result<Vec<Self>, Error> {
@@ -531,8 +593,8 @@ impl SolidStruct for Solid {
 		for s in solids {
 			ffi::shape_vec_push(solid_vec.pin_mut(), s.inner());
 		}
-		let mut history: Vec<u64> = Default::default();
-		let inner = ffi::builder_cells(&solid_vec, clauses, &mut history);
+		let mut history = History::default();
+		let inner = ffi::builder_cells(&solid_vec, clauses, &mut history.faces, &mut history.edges);
 		if inner.is_null() {
 			return Err(Error::BooleanOperationFailed);
 		}
@@ -540,7 +602,7 @@ impl SolidStruct for Solid {
 		#[cfg(feature = "color")]
 		let colormap = {
 			let mut m = std::collections::HashMap::new();
-			for pair in history.chunks_exact(2) {
+			for pair in history.faces.chunks_exact(2) {
 				for s in solids {
 					if let Some(&c) = s.colormap.get(&pair[1]) {
 						m.entry(pair[0]).or_insert(c);
@@ -607,6 +669,10 @@ impl SolidStruct for Solid {
 	}
 
 	// ==================== Queries ====================
+
+	fn is_valid(&self) -> bool {
+		ffi::shape_is_valid(&self.inner)
+	}
 
 	fn volume(&self) -> f64 {
 		ffi::shape_volume(&self.inner)

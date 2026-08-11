@@ -1,5 +1,5 @@
 use super::ffi;
-use super::solid::Solid;
+use super::solid::{History, Solid};
 #[cfg(feature = "color")]
 use crate::common::color::Color;
 
@@ -10,7 +10,7 @@ pub(crate) struct CompoundShape {
 	inner: cxx::UniquePtr<ffi::TopoDS_Shape>,
 	#[cfg(feature = "color")]
 	colormap: std::collections::HashMap<u64, Color>,
-	history: Vec<u64>,
+	history: History,
 }
 
 impl CompoundShape {
@@ -37,7 +37,7 @@ impl CompoundShape {
 	}
 
 	/// Create a compound from a raw `TopoDS_Shape` (e.g. from I/O or boolean ops).
-	pub fn from_raw(inner: cxx::UniquePtr<ffi::TopoDS_Shape>, #[cfg(feature = "color")] colormap: std::collections::HashMap<u64, Color>, history: Vec<u64>) -> Self {
+	pub fn from_raw(inner: cxx::UniquePtr<ffi::TopoDS_Shape>, #[cfg(feature = "color")] colormap: std::collections::HashMap<u64, Color>, history: History) -> Self {
 		CompoundShape {
 			inner,
 			#[cfg(feature = "color")]
