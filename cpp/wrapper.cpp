@@ -63,6 +63,7 @@
 // --- Boolean operations & shape cleanup ---
 #include <BOPAlgo_CellsBuilder.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
+#include <ShapeFix_Face.hxx>
 #include <BRepTools_History.hxx>
 
 // --- Sweep / pipe / loft ---
@@ -142,6 +143,26 @@ namespace cadrum {
 //     top/bottom filters), not by id.
 static inline uint64_t subshape_id(const TopoDS_Shape& s) {
     return reinterpret_cast<uint64_t>(s.TShape().get());
+}
+
+// The SECOND identity channel: TShape* **and** TopLoc_Location, orientation
+// still ignored — exactly `TopoDS_Shape::IsSame` semantics, which OCCT already
+// hands out as `std::hash<TopoDS_Shape>` (TopoDS_Shape.hxx: hash_combine of the
+// TShape pointer with the location hash).
+//
+// It exists BECAUSE `subshape_id` drops the location, and that trade-off has
+// exactly one victim, named above: a swept solid builds its end cap as the same
+// TShape under a different location, so top and bottom of a prism collapse onto
+// one id. Callers could tell them apart geometrically or not at all — and
+// "geometrically" means world Z, which stops being an answer the moment the
+// profile plane is tilted.
+//
+// An ADDITIONAL channel, never a replacement. Ids stay the key for provenance
+// because they survive translate/rotate; keys separate co-located twins **within
+// one build**. A key where an id belongs would lose every name the first time a
+// part is moved into an assembly.
+static inline uint64_t subshape_key(const TopoDS_Shape& s) {
+    return static_cast<uint64_t>(std::hash<TopoDS_Shape>{}(s));
 }
 
 // Forward declaration: STEP read post-process (defined further below near
@@ -529,13 +550,37 @@ void compound_add(TopoDS_Shape& compound, const TopoDS_Shape& child) {
 //   the face still represents the same plane — it just has smaller bounds.
 //   Generated(tool_face) returns empty because no wholly NEW face was created.
 //
-// out_history is built from composable relay maps shared by boolean (copy-based)
-// and shell/fillet/chamfer (no copy):
+// out_history is built from composable relay tables shared by boolean
+// (copy-based) and shell/fillet/chamfer (no copy):
 //   relay_from_builder  {result/pre → src}  (all builders)
 //   relay_from_pair     {post → pre}        (copy-based only)
 //   relay_into_history  compose → flat [post, src] pairs
-// relay_into_history emits only the outermost map's keys (the real result
+// relay_into_history emits only the outermost table's keys (the real result
 // faces), so no bogus pre/src-only ids leak in.
+//
+// A Relay is a MULTIMAP, and that is load-bearing: OCCT's Modified() is n↔n.
+// The 1→n direction (one source face split into several by a boolean) works
+// with a plain map because each result gets its own key. The n→1 direction —
+// two source faces merged into ONE result face — does not: a plain map would
+// let the second write silently overwrite the first, and which source survives
+// would depend on TopExp traversal and hash order. A caller that hangs names on
+// faces (rustcad's `body/naming.rs`) would lose one of the two names, without a
+// diagnostic and without reproducibility.
+//
+// Whether any operation currently reaches that state is a separate question
+// (`tests/history.rs` measures it). The table has no business deciding it.
+using Relay = std::unordered_multimap<uint64_t, uint64_t>;
+
+// Insert unless the exact pair is already there. Duplicate pairs would be
+// harmless downstream (the Rust side sorts and dedups) but they inflate the
+// table and make it read as if a merge had happened where none did.
+static inline void relay_add(Relay& relay, uint64_t key, uint64_t value) {
+    auto range = relay.equal_range(key);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == value) return;
+    }
+    relay.emplace(key, value);
+}
 
 // {result/pre → src}: Modified() empty ⇒ identity, else each split target → src.
 // Modified()/IsDeleted() are non-const, so Builder& (not const).
@@ -546,7 +591,7 @@ static void relay_from_builder(
     Builder& builder,
     const TopoDS_Shape& src,
     TopAbs_ShapeEnum kind,
-    std::unordered_map<uint64_t, uint64_t>& relay)
+    Relay& relay)
 {
     for (TopExp_Explorer ex(src, kind); ex.More(); ex.Next()) {
         const TopoDS_Shape& sf = ex.Current();
@@ -554,11 +599,11 @@ static void relay_from_builder(
         if (builder.IsDeleted(sf)) continue;
         const NCollection_List<TopoDS_Shape>& mods = builder.Modified(sf);
         if (mods.IsEmpty()) {
-            relay[src_id] = src_id;
+            relay_add(relay, src_id, src_id);
         } else {
             for (NCollection_List<TopoDS_Shape>::Iterator it(mods); it.More(); it.Next()) {
                 uint64_t pre_id = subshape_id(it.Value());
-                relay[pre_id] = src_id;
+                relay_add(relay, pre_id, src_id);
             }
         }
     }
@@ -570,7 +615,7 @@ static void relay_from_pair(
     const TopoDS_Shape& pre_shape,
     const TopoDS_Shape& post_shape,
     TopAbs_ShapeEnum kind,
-    std::unordered_map<uint64_t, uint64_t>& relay)
+    Relay& relay)
 {
     NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> pre_map, post_map;
     TopExp::MapShapes(pre_shape, kind, pre_map);
@@ -579,15 +624,18 @@ static void relay_from_pair(
     for (int i = 1; i <= pre_map.Extent(); ++i) {
         uint64_t pre_id = subshape_id(pre_map(i));
         uint64_t post_id = subshape_id(post_map(i));
-        relay[post_id] = pre_id;
+        relay_add(relay, post_id, pre_id);
     }
 }
 
 // Emit [post, src] pairs. relay2==null: flatten relay1 (its keys are final).
 // relay2!=null: iterate relay2 keys (post) and resolve post→pre→src via relay1.
+// Both steps fan out over every match, so an n→1 merge arrives downstream as n
+// pairs sharing one post id — the honest report, and what the Rust side's
+// {src → [post]} inversion already expects.
 static void relay_into_history(
-    const std::unordered_map<uint64_t, uint64_t>* relay1,
-    const std::unordered_map<uint64_t, uint64_t>* relay2,
+    const Relay* relay1,
+    const Relay* relay2,
     rust::Vec<uint64_t>& out)
 {
     if (relay2 == nullptr) {
@@ -597,10 +645,11 @@ static void relay_into_history(
         }
     } else {
         for (const auto& kv : *relay2) {
-            auto it = relay1->find(kv.second);
-            if (it == relay1->end()) continue;
-            out.push_back(kv.first);
-            out.push_back(it->second);
+            auto range = relay1->equal_range(kv.second);
+            for (auto it = range.first; it != range.second; ++it) {
+                out.push_back(kv.first);
+                out.push_back(it->second);
+            }
         }
     }
 }
@@ -615,7 +664,7 @@ static void emit_builder_history(
     rust::Vec<uint64_t>& out_faces,
     rust::Vec<uint64_t>& out_edges)
 {
-    std::unordered_map<uint64_t, uint64_t> rf, re;
+    Relay rf, re;
     relay_from_builder(builder, src, TopAbs_FACE, rf);
     relay_from_builder(builder, src, TopAbs_EDGE, re);
     relay_into_history(&rf, nullptr, out_faces);
@@ -741,7 +790,7 @@ static void emit_pair_history(
     rust::Vec<uint64_t>& out_faces,
     rust::Vec<uint64_t>& out_edges)
 {
-    std::unordered_map<uint64_t, uint64_t> rf, re;
+    Relay rf, re;
     relay_from_pair(pre_shape, post_shape, TopAbs_FACE, rf);
     relay_from_pair(pre_shape, post_shape, TopAbs_EDGE, re);
     relay_into_history(&rf, nullptr, out_faces);
@@ -795,8 +844,8 @@ std::unique_ptr<TopoDS_Shape> builder_cells(
         }
         cb.RemoveInternalBoundaries();
 
-        std::unordered_map<uint64_t, uint64_t> relay1, relay2;   // faces
-        std::unordered_map<uint64_t, uint64_t> relay1e, relay2e; // edges
+        Relay relay1, relay2;   // faces
+        Relay relay1e, relay2e; // edges
         for (const auto& s : solids) {
             relay_from_builder(cb, s, TopAbs_FACE, relay1);
             relay_from_builder(cb, s, TopAbs_EDGE, relay1e);
@@ -1165,6 +1214,10 @@ uint64_t shape_tshape_id(const TopoDS_Shape& shape) {
 
 uint64_t edge_tshape_id(const TopoDS_Edge& edge) {
     return subshape_id(edge);
+}
+
+uint64_t face_located_key(const TopoDS_Face& face) {
+    return subshape_key(face);
 }
 
 bool face_project_point(const TopoDS_Face& face,
@@ -1741,7 +1794,7 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
         builder.Build();
         if (!builder.IsDone()) return nullptr;
         // No copy, so relay keys are final faces.
-        std::unordered_map<uint64_t, uint64_t> relay;
+        Relay relay;
         relay_from_builder(builder, solid, TopAbs_FACE, relay);
         // MakeThickSolid does not flag removed open faces as IsDeleted; drop
         // their (identity) pairs since those faces are absent from the result.
@@ -1757,7 +1810,7 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
         // removed open face are usually shared with a retained adjacent face and
         // survive, so the face-specific erase above does not apply; over-inclusion
         // is harmless because consumers filter by src-edge membership.
-        std::unordered_map<uint64_t, uint64_t> relay_e;
+        Relay relay_e;
         relay_from_builder(builder, solid, TopAbs_EDGE, relay_e);
         relay_into_history(&relay_e, nullptr, out_edge_history);
         return std::make_unique<TopoDS_Shape>(builder.Shape());
@@ -1889,19 +1942,63 @@ std::unique_ptr<TopoDS_Shape> make_extrude(
 {
     try {
         if (profile_edges.empty()) return nullptr;
-        BRepBuilderAPI_MakeWire wire_maker;
+
+        // Split at the null-edge sentinels: group 0 is the outer contour, the
+        // rest are holes. Without a sentinel this is one group and everything
+        // below collapses to the original single-wire path.
+        std::vector<std::vector<TopoDS_Edge>> groups(1);
+        for (const auto& e : profile_edges) {
+            if (e.IsNull()) {
+                if (!groups.back().empty()) groups.emplace_back();
+                continue;
+            }
+            groups.back().push_back(e);
+        }
+        if (groups.back().empty()) groups.pop_back();
+        if (groups.empty()) return nullptr;
+
         std::vector<TopoDS_Edge> wire_edges;
         std::vector<uint64_t> src_ids;
-        for (const auto& e : profile_edges) {
-            wire_maker.Add(e);
-            if (!wire_maker.IsDone()) return nullptr;
-            wire_edges.push_back(wire_maker.Edge());
-            src_ids.push_back(subshape_id(e));
+        std::vector<TopoDS_Wire> wires;
+        for (const auto& group : groups) {
+            BRepBuilderAPI_MakeWire wire_maker;
+            for (const auto& e : group) {
+                wire_maker.Add(e);
+                if (!wire_maker.IsDone()) return nullptr;
+                // Kept flat across all wires, and that is deliberate: the caller
+                // names segments, not contours, and emit_generated_from_profile
+                // walks this list index-parallel with src_ids. A hole's wall
+                // gets its name here, at birth, instead of inheriting it from a
+                // cutting tool afterwards.
+                wire_edges.push_back(wire_maker.Edge());
+                src_ids.push_back(subshape_id(e));
+            }
+            wires.push_back(wire_maker.Wire());
         }
-        BRepBuilderAPI_MakeFace face_maker(wire_maker.Wire());
+
+        BRepBuilderAPI_MakeFace face_maker(wires[0]);
         if (!face_maker.IsDone()) return nullptr;
+        for (size_t i = 1; i < wires.size(); ++i) {
+            face_maker.Add(wires[i]);
+            if (!face_maker.IsDone()) return nullptr;
+        }
+        // A hole must run against the outer contour's sense, and the caller's
+        // winding is not knowable here — MEASURED: reversing every inner wire
+        // gets a square hole right and an arc-bottomed chamber wrong (its area
+        // is then ADDED instead of subtracted, silently, on a face OCCT still
+        // calls done). So the sense is computed, not assumed.
+        //
+        // ShapeFix_Face only flips wire orientations; it does not rebuild the
+        // edges underneath, and `subshape_id` ignores orientation anyway — so
+        // the ids handed to emit_generated_from_profile stay valid.
+        TopoDS_Face profile_face = face_maker.Face();
+        if (wires.size() > 1) {
+            ShapeFix_Face fixer(profile_face);
+            fixer.FixOrientation();
+            profile_face = fixer.Face();
+        }
         gp_Vec dir(dx, dy, dz);
-        BRepPrimAPI_MakePrism prism(face_maker.Face(), dir);
+        BRepPrimAPI_MakePrism prism(profile_face, dir);
         prism.Build();
         if (!prism.IsDone()) return nullptr;
         emit_generated_from_profile(prism, wire_edges, src_ids, out_gen_faces, out_gen_edges);

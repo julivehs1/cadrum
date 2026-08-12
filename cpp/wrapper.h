@@ -382,6 +382,16 @@ std::unique_ptr<TopoDS_Edge> mirror_edge(
 // neighbours. Plus the cap pairs [cap_face, 0] (see emit_sweep_caps in
 // wrapper.cpp): src 0 reads "the profile as a whole", because a cap is bounded
 // by every segment and belongs to none.
+//
+// `profile_edges` may describe SEVERAL wires, separated by null-edge sentinels
+// (the same convention make_pipe_shell uses for its sections). The first wire is
+// the outer contour, every further one is a hole in it — the prism then comes
+// out of the kernel with its holes already in place, instead of being cut out
+// afterwards with a boolean. That matters beyond speed: a boolean rebuilds the
+// topology, and the rebuild is what severs a swept solid's cap provenance (the
+// two caps share one TShape id at birth, so once they are split apart there is
+// nothing left to say which was which). A sentinel-free vector behaves exactly
+// as before.
 std::unique_ptr<TopoDS_Shape> make_extrude(
     const std::vector<TopoDS_Edge>& profile_edges,
     double dx, double dy, double dz,
@@ -489,6 +499,14 @@ uint64_t face_tshape_id(const TopoDS_Face& face);
 double face_area(const TopoDS_Face& face);
 uint64_t shape_tshape_id(const TopoDS_Shape& shape);
 uint64_t edge_tshape_id(const TopoDS_Edge& edge);
+
+// Identity that ALSO takes the TopLoc_Location into account (orientation still
+// ignored) — `TopoDS_Shape::IsSame` semantics via `std::hash<TopoDS_Shape>`.
+// The separate channel exists because `face_tshape_id` deliberately drops the
+// location, which collapses the two caps of a swept solid onto one id. Ids stay
+// the key for provenance (they survive translate/rotate); this key separates
+// co-located twins within one build. See `subshape_key` in wrapper.cpp.
+uint64_t face_located_key(const TopoDS_Face& face);
 
 // Project a 3D point onto `face`. Sister of `edge_project_point`.
 // Returns the closest point on the (trimmed) face surface and the outward

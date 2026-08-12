@@ -130,6 +130,7 @@ mod ffi_bridge {
 		// ==================== Face Methods ====================
 
 		fn face_tshape_id(face: &TopoDS_Face) -> u64;
+		fn face_located_key(face: &TopoDS_Face) -> u64;
 		fn face_area(face: &TopoDS_Face) -> f64;
 		fn shape_tshape_id(shape: &TopoDS_Shape) -> u64;
 		fn edge_tshape_id(edge: &TopoDS_Edge) -> u64;

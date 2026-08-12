@@ -421,6 +421,25 @@ pub trait FaceStruct: Sized {
 	/// meaning beyond equality / hash use.
 	fn id(&self) -> u64;
 
+	/// Identity that also accounts for the face's **location** — `IsSame`
+	/// semantics (TShape + TopLoc_Location, orientation ignored).
+	///
+	/// A second channel next to [`id`](Self::id), not a replacement, and the two
+	/// answer different questions:
+	///
+	/// * `id()` survives translate / rotate, because those only set a location
+	///   and this deliberately ignores it. That is what makes it usable as a
+	///   provenance key across a move — and it is why the two caps of a swept
+	///   solid, which OCCT builds as one TShape under two locations, report the
+	///   **same** id (measured in `tests/history.rs`).
+	/// * `key()` tells exactly those two apart, and loses its meaning the moment
+	///   the shape is moved.
+	///
+	/// So: match history and carry names with `id()`; separate co-located twins
+	/// within one build with `key()`. Using `key()` as a provenance key would
+	/// drop every name the first time a part is placed in an assembly.
+	fn key(&self) -> u64;
+
 	/// Project a 3D point onto this face. Returns `(closest_point,
 	/// outward_normal)`. Sister of `Wire::project` which returns `(closest,
 	/// tangent)` on a 1D curve.
@@ -604,6 +623,22 @@ pub trait SolidStruct: Sized + Clone + Transform {
 	/// Internally builds a face from the wire and uses `BRepPrimAPI_MakePrism`.
 	/// Fails if the profile is empty, not closed, or the direction is zero-length.
 	fn extrude<'a>(profile: impl IntoIterator<Item = &'a Self::Edge>, dir: DVec3) -> Result<Self, Error>
+	where
+		Self::Edge: 'a;
+
+	/// Extrude a profile **with holes**: the first wire is the outer contour,
+	/// every further one a hole in it. Same builder as [`extrude`](Self::extrude)
+	/// (which is this with a single wire), the face just carries inner wires.
+	///
+	/// The point is not only that it saves a boolean per holed sketch — it is
+	/// that it saves the *rebuild*. Cutting the holes afterwards rebuilds the
+	/// topology, and a swept solid's two caps share one TShape id at birth
+	/// (`tests/history.rs`), so once a rebuild splits them apart nothing can say
+	/// which was the far one. Born with its holes, the prism keeps that answer.
+	///
+	/// Hole wires may be given in either sense; the builder reverses them
+	/// against the outer contour. Wires must not intersect each other.
+	fn extrude_with_holes<'a, I: IntoIterator<Item = &'a Self::Edge>, W: IntoIterator<Item = I>>(wires: W, dir: DVec3) -> Result<Self, Error>
 	where
 		Self::Edge: 'a;
 

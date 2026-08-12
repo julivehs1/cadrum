@@ -306,9 +306,21 @@ impl SolidStruct for Solid {
 	// ==================== Extrude ====================
 
 	fn extrude<'a>(profile: impl IntoIterator<Item = &'a Edge>, dir: DVec3) -> Result<Self, Error> {
+		Self::extrude_with_holes(std::iter::once(profile), dir)
+	}
+
+	fn extrude_with_holes<'a, I: IntoIterator<Item = &'a Edge>, W: IntoIterator<Item = I>>(wires: W, dir: DVec3) -> Result<Self, Error> {
 		let mut profile_vec = ffi::edge_vec_new();
-		for e in profile {
-			ffi::edge_vec_push(profile_vec.pin_mut(), &e.inner);
+		for (i, wire) in wires.into_iter().enumerate() {
+			// Null-Edge trennt die Konturen (dieselbe Konvention wie bei
+			// make_pipe_shell). Nur ZWISCHEN den Wires, damit ein einzelnes
+			// Profil byte-gleich dasselbe schickt wie vorher.
+			if i > 0 {
+				ffi::edge_vec_push_null(profile_vec.pin_mut());
+			}
+			for e in wire {
+				ffi::edge_vec_push(profile_vec.pin_mut(), &e.inner);
+			}
 		}
 		// Nur die `gen_*`-Tabellen: extrude baut die Topologie komplett neu, es
 		// gibt also keine Modified()-Beziehung — jede Fläche und jede Kante des

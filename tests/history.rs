@@ -318,10 +318,16 @@ fn test_extrude_populates_generated_faces_from_profile() {
 /// bewusst ignoriert (siehe cpp/wrapper.cpp). Ein Prisma über einem Quadrat hat
 /// nach Euler 6 Flächen — gemeldet werden 5 Ids.
 ///
-/// Folge für den Aufrufer: ein Name kann eine Kappe von den Mantelflächen
-/// trennen, aber **nicht Deckel von Boden**. Diese Unterscheidung bleibt
-/// geometrisch, genau wie bei den Kanten. Steht der Test eines Tages auf 6
-/// verschiedenen Ids, ist die Einschränkung weg und der Aufrufer darf mehr.
+/// Folge für den Aufrufer: ein **Name** kann eine Kappe von den Mantelflächen
+/// trennen, aber nicht Deckel von Boden — die Namensbindung läuft über `id()`,
+/// und die muss lage-blind bleiben, damit sie eine Verschiebung übersteht.
+///
+/// Seit August 2026 ist das nicht mehr die einzige Auskunft: der zweite Kanal
+/// `Face::key()` nimmt die Location mit und trennt die beiden
+/// (`test_located_key_separates_what_the_id_merges`). Der Preis steht dort — ein
+/// Schlüssel überlebt keine Bewegung. Zwei Fragen, zwei Kanäle; dieser Test
+/// nagelt den lage-blinden fest, und dass er weiter auf **5** steht, ist die
+/// Zusage, auf der die Namen beruhen.
 #[test]
 fn test_extrude_caps_share_one_tshape_id() {
 	use cadrum::Surface;
@@ -413,4 +419,186 @@ fn test_boolean_carries_a_generated_tool_face_into_the_result() {
 		cadrum::Surface::Cylinder { radius, .. } => assert!((radius - 1.5).abs() < 1e-9, "r=1.5 erwartet, {radius}"),
 		s => panic!("Bohrungswand ist ein Zylinder, nicht {s:?}"),
 	}
+}
+
+/// **Ein Boolean, der zwei Flächen verschmilzt, muss BEIDE Quellen melden.**
+///
+/// Der Auslöser ist nicht der gestapelte Quader (dort bleiben die Seitenflächen
+/// getrennt), sondern die **L-Form**: zwei Klötze mit bündigen Seitenflächen.
+/// Deren koplanare Flächen werden zu je einer verschmolzen — der n→1-Fall: zwei
+/// Quell-Flächen, ein Ergebnis. Gemessen, nicht angenommen; die gestapelte
+/// Variante steht unten als Gegenprobe für die **Kanten**.
+///
+/// Die Herkunftstabelle muss dann ZWEI Paare melden, nicht eines. Meldet sie nur
+/// eines, entscheidet die Hash-Reihenfolge, welche Quelle gewinnt — und ein
+/// Aufrufer, der Namen an Flächen hängt (rustcads `body/naming.rs`), verliert die
+/// Hälfte davon still und nicht reproduzierbar. Ein Winkel aus zwei Klötzen ist
+/// die häufigste Form überhaupt, also war das kein Randfall.
+#[test]
+fn test_boolean_merge_reports_every_source_face() {
+	let foot = Solid::cube(DVec3::ZERO, DVec3::new(20.0, 10.0, 10.0));
+	let leg = Solid::cube(DVec3::ZERO, DVec3::new(10.0, 10.0, 30.0));
+	let foot_faces: HashSet<u64> = foot.iter_face().map(|f| f.id()).collect();
+	let leg_faces: HashSet<u64> = leg.iter_face().map(|f| f.id()).collect();
+	// Ohne sechs unterscheidbare Ids je Quader misst der Rest nichts.
+	assert_eq!(foot_faces.len(), 6, "ein Quader hat sechs unterscheidbare Flächen-Ids");
+	assert_eq!(leg_faces.len(), 6, "ein Quader hat sechs unterscheidbare Flächen-Ids");
+
+	let angle: Solid = (&foot + &leg).build().expect("union");
+	let hist: Vec<[u64; 2]> = angle.iter_history().collect();
+	let srcs: HashSet<u64> = hist.iter().map(|[_, s]| *s).collect();
+
+	// Keine Quelle darf verschwinden: jede Fläche beider Klötze steht entweder in
+	// der Tabelle oder ist gelöscht — und gelöscht wird bei dieser Union keine,
+	// weil sich die beiden nur berühren und nicht durchdringen.
+	let kept_foot = foot_faces.iter().filter(|f| srcs.contains(f)).count();
+	let kept_leg = leg_faces.iter().filter(|f| srcs.contains(f)).count();
+	assert_eq!(kept_foot, 6, "vom Fuß melden nur {kept_foot} von 6 Flächen eine Herkunft");
+	assert_eq!(kept_leg, 6, "vom Schenkel melden nur {kept_leg} von 6 Flächen eine Herkunft");
+
+	// Und die verschmolzenen Flächen nennen ZWEI verschiedene Quellen — sonst hat
+	// die Tabelle den Verschmelzungsfall gar nicht abgebildet.
+	let merged = posts_with_two_sources(&hist);
+	assert!(merged >= 1, "keine Ergebnisfläche nennt zwei Quellen — der n→1-Kollaps ist noch da");
+}
+
+/// Dasselbe eine Dimension tiefer, und der Fall trifft **jede** gestapelte
+/// Union: die Seitenflächen bleiben dort getrennt, die Kanten an der Nahtstelle
+/// nicht. Ohne Multimap gingen hier vier Kanten-Namen je Stapelung verloren.
+#[test]
+fn test_boolean_merge_reports_every_source_edge() {
+	let lower = Solid::cube(DVec3::ZERO, DVec3::new(10.0, 10.0, 10.0));
+	let upper = Solid::cube(DVec3::new(0.0, 0.0, 10.0), DVec3::new(10.0, 10.0, 20.0));
+	let lower_edges: HashSet<u64> = lower.iter_edge().map(|e| e.id()).collect();
+
+	let fused: Solid = (&lower + &upper).build().expect("union");
+	let hist: Vec<[u64; 2]> = fused.iter_edge_history().collect();
+	let srcs: HashSet<u64> = hist.iter().map(|[_, s]| *s).collect();
+
+	assert!(lower_edges.iter().any(|e| srcs.contains(e)), "der untere Quader ist Quelle von Ergebnis-Kanten");
+	let merged = posts_with_two_sources(&hist);
+	assert!(merged >= 1, "keine Ergebnis-Kante nennt zwei Quellen — der n→1-Kollaps ist noch da");
+}
+
+/// Wie viele Ergebnis-Ids nennen mindestens zwei verschiedene Quellen?
+fn posts_with_two_sources(hist: &[[u64; 2]]) -> usize {
+	let mut by_post: std::collections::HashMap<u64, HashSet<u64>> = std::collections::HashMap::new();
+	for [p, s] in hist {
+		by_post.entry(*p).or_default().insert(*s);
+	}
+	by_post.values().filter(|s| s.len() >= 2).count()
+}
+
+/// **Der zweite Identitätskanal — und sein Preis, in einem Test.**
+///
+/// `Face::key()` nimmt die `TopLoc_Location` mit (`IsSame`-Semantik), `id()`
+/// wirft sie weg. Beide Zeilen dieses Tests sind die Begründung dafür, dass es
+/// zwei gibt und nicht einen:
+///
+/// * Ein Prisma über einem Quadrat hat nach Euler sechs Flächen. `id()` meldet
+///   **fünf** — Deckel und Boden sind dieselbe TShape unter zwei Locations.
+///   `key()` meldet **sechs**: es trennt, was die Id verschmilzt.
+/// * Nach `translate` sind die Ids **dieselben** (nur eine Location kam dazu),
+///   die Schlüssel **andere**. Genau deshalb darf ein Name nie am Schlüssel
+///   hängen: er stürbe bei der ersten Montage.
+///
+/// Ein Primitiv (Würfel) hat den Fall nicht — dort sind schon die Ids
+/// verschieden. Das steht als Gegenprobe daneben, damit der Test nicht bloß
+/// „key ist feiner" zeigt, sondern *wo* der Unterschied herkommt.
+#[test]
+fn test_located_key_separates_what_the_id_merges() {
+	let prism = Solid::extrude(&square(10.0), DVec3::new(0.0, 0.0, 20.0)).expect("prism");
+	assert_eq!(prism.iter_face().count(), 6, "ein Prisma über einem Quadrat hat sechs Flächen");
+	let ids: HashSet<u64> = prism.iter_face().map(|f| f.id()).collect();
+	let keys: HashSet<u64> = prism.iter_face().map(|f| f.key()).collect();
+	assert_eq!(ids.len(), 5, "die Kappen teilen eine TShape-Id");
+	assert_eq!(keys.len(), 6, "der Schlüssel trennt sie");
+
+	// Gegenprobe: beim Primitiv gibt es nichts zu trennen.
+	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
+	let cube_ids: HashSet<u64> = cube.iter_face().map(|f| f.id()).collect();
+	let cube_keys: HashSet<u64> = cube.iter_face().map(|f| f.key()).collect();
+	assert_eq!(cube_ids.len(), 6, "ein Würfel teilt keine TShapes");
+	assert_eq!(cube_keys.len(), 6);
+
+	// Der Preis: `share()` teilt die TShapes, `translate` setzt nur eine
+	// Location — die Ids überleben das, die Schlüssel nicht.
+	let moved = prism.share().translate(DVec3::new(0.0, 0.0, 5.0));
+	let moved_ids: HashSet<u64> = moved.iter_face().map(|f| f.id()).collect();
+	let moved_keys: HashSet<u64> = moved.iter_face().map(|f| f.key()).collect();
+	assert_eq!(moved_ids, ids, "Ids überstehen eine Verschiebung — darauf beruhen die Namen");
+	assert!(moved_keys.is_disjoint(&keys), "Schlüssel überstehen sie nicht, und das ist der Preis");
+}
+
+/// **Ein Prisma mit Loch, ohne Boolean** — und warum das eine Herkunftsfrage ist
+/// und keine Geschwindigkeitsfrage.
+///
+/// `extrude_with_holes` gibt dem Kernel die Innenkonturen als innere Wires der
+/// Profilfläche mit. Bis dahin wurde ein Loch nachträglich herausgeschnitten,
+/// und dieser Schnitt baut die Topologie neu. Der Rebuild ist es, der die
+/// Kappen-Auskunft zerreißt: Deckel und Boden teilen bei der Geburt EINE
+/// TShape-Id (`test_extrude_caps_share_one_tshape_id`), und sobald ein Boolean
+/// sie in zwei Ids zerlegt, sagt die Herkunftstabelle nur noch „aus X wurden A
+/// und B" — welche der beiden der Deckel war, steht nirgends mehr.
+///
+/// Geboren mit seinem Loch behält das Prisma die Antwort: die Kappen teilen
+/// weiterhin eine Id (der Schlüssel trennt sie), und die Lochwände tragen ihre
+/// Herkunft direkt aus der Innenkontur statt sie von einem Werkzeug zu erben.
+#[test]
+fn test_extrude_with_holes_keeps_cap_provenance() {
+	let outer = square(20.0);
+	let hole = Edge::polygon(&[DVec3::new(5.0, 5.0, 0.0), DVec3::new(15.0, 5.0, 0.0), DVec3::new(15.0, 15.0, 0.0), DVec3::new(5.0, 15.0, 0.0)]).expect("hole polygon");
+	let hole_srcs: HashSet<u64> = hole.iter().map(|e| e.id()).collect();
+
+	let solid = Solid::extrude_with_holes([outer.iter(), hole.iter()], DVec3::new(0.0, 0.0, 4.0)).expect("extrude with hole");
+
+	// Das Loch ist ein Loch und kein zweiter Klotz — analytisch, nicht aus der
+	// Rechnung des Prüflings: (20² − 10²) · 4.
+	assert!((solid.volume() - (20.0 * 20.0 - 10.0 * 10.0) * 4.0).abs() < 1e-6, "Volumen {}", solid.volume());
+	assert!(solid.is_valid(), "der Kernel hält das Ergebnis für gültig");
+
+	// Die Kappen-Auskunft steht noch: 10 Flächen, aber nur 9 Ids — Deckel und
+	// Boden liegen weiter unter einer, und genau das ist die Zusage, die ein
+	// nachträglicher Boolean zerstört hätte.
+	assert_eq!(solid.iter_face().count(), 10, "4 außen + 4 innen + 2 Kappen");
+	assert_eq!(solid.iter_face().map(|f| f.id()).collect::<HashSet<_>>().len(), 9, "die Kappen teilen eine Id");
+	assert_eq!(solid.iter_face().map(|f| f.key()).collect::<HashSet<_>>().len(), 10, "der Schlüssel trennt sie");
+
+	// Und die Lochwände sind benannt — bei der Geburt, aus ihrer eigenen
+	// Innenkontur, statt von einem Schnittwerkzeug geerbt.
+	let walls = solid.iter_generated_faces().filter(|[_, s]| hole_srcs.contains(s)).count();
+	assert_eq!(walls, 4, "jede Innenkontur-Kante wächst zu einer Lochwand");
+}
+
+/// **Der Wicklungssinn einer Lochkontur ist nicht vorhersehbar — also wird er
+/// bestimmt und nicht angenommen.**
+///
+/// Die erste Fassung von `extrude_with_holes` drehte jede Innenkontur pauschal
+/// um. Das ist an einem Lochquadrat richtig, das im selben Sinn wie die
+/// Außenkontur gezeichnet ist, und **falsch** an einem, das schon
+/// entgegengesetzt läuft: die Lochfläche wird dann **addiert statt abgezogen**,
+/// und OCCT meldet die Fläche trotzdem als `IsDone`. Gemessen an einer
+/// Kammerkontur aus rustcads Strangprofil — 36 000 + Kammerfläche statt
+/// 36 000 − Kammerfläche, ohne eine einzige Fehlermeldung.
+///
+/// Eine Skizze hat keinen kanonischen Umlaufsinn (er fällt aus der Zeichen-
+/// reihenfolge), also darf der Bau ihn nicht raten. `ShapeFix_Face::
+/// FixOrientation` entscheidet es an der Geometrie. Dieser Test hält beide
+/// Fälle fest; vor dem Fix fiel genau einer von beiden durch.
+#[test]
+fn test_extrude_with_holes_orients_either_winding() {
+	let dir = DVec3::new(0.0, 0.0, 4.0);
+	let want = (20.0 * 20.0 - 10.0 * 10.0) * 4.0;
+
+	// Loch im GLEICHEN Umlaufsinn wie die Außenkontur (beide gegen den Uhrzeiger).
+	let same = Edge::polygon(&[DVec3::new(5.0, 5.0, 0.0), DVec3::new(15.0, 5.0, 0.0), DVec3::new(15.0, 15.0, 0.0), DVec3::new(5.0, 15.0, 0.0)]).expect("hole ccw");
+	let a = Solid::extrude_with_holes([square(20.0).iter(), same.iter()], dir).expect("same winding");
+	assert!((a.volume() - want).abs() < 1e-6, "gleicher Umlaufsinn: {} statt {want}", a.volume());
+	assert!(a.is_valid());
+
+	// Und im ENTGEGENGESETZTEN — derselbe Körper, dieselbe Zahl.
+	let opposite = Edge::polygon(&[DVec3::new(5.0, 5.0, 0.0), DVec3::new(5.0, 15.0, 0.0), DVec3::new(15.0, 15.0, 0.0), DVec3::new(15.0, 5.0, 0.0)]).expect("hole cw");
+	let b = Solid::extrude_with_holes([square(20.0).iter(), opposite.iter()], dir).expect("opposite winding");
+	assert!((b.volume() - want).abs() < 1e-6, "entgegengesetzter Umlaufsinn: {} statt {want}", b.volume());
+	assert!(b.is_valid());
 }

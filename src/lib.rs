@@ -125,6 +125,9 @@ impl Face {
 	pub fn id(&self) -> u64 {
 		<Self as crate::traits::FaceStruct>::id(self)
 	}
+	pub fn key(&self) -> u64 {
+		<Self as crate::traits::FaceStruct>::key(self)
+	}
 	pub fn project(&self, p: DVec3) -> (DVec3, DVec3) {
 		<Self as crate::traits::FaceStruct>::project(self, p)
 	}
@@ -213,6 +216,9 @@ impl Solid {
 	}
 	pub fn extrude<'a>(profile: impl IntoIterator<Item = &'a Edge>, dir: DVec3) -> Result<crate::Solid, Error> {
 		<Self as crate::traits::SolidStruct>::extrude(profile, dir)
+	}
+	pub fn extrude_with_holes<'a, I: IntoIterator<Item = &'a Edge>, W: IntoIterator<Item = I>>(wires: W, dir: DVec3) -> Result<crate::Solid, Error> {
+		<Self as crate::traits::SolidStruct>::extrude_with_holes(wires, dir)
 	}
 	pub fn revolve<'a>(profile: impl IntoIterator<Item = &'a Edge>, axis_origin: DVec3, axis_direction: DVec3, angle: f64) -> Result<crate::Solid, Error> {
 		<Self as crate::traits::SolidStruct>::revolve(profile, axis_origin, axis_direction, angle)
