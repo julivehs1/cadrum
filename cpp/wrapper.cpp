@@ -35,6 +35,8 @@
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepLib.hxx>
+// Der ASCII-BREP-Leser — das Format, in dem FreeCAD die Körper einer .FCStd ablegt.
+#include <BRepTools.hxx>
 #include <BRepLib_ToolTriangulatedShape.hxx>
 #include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -265,8 +267,24 @@ std::unique_ptr<TopoDS_Shape> read_brep_stream(
         std::string(reinterpret_cast<const char*>(data.data()), data.size()));
 
     auto shape = std::make_unique<TopoDS_Shape>();
+
+    // Two BREP flavours share the extension. BinTools is what we write; the ASCII
+    // form ("CASCADE Topology V<n>") is what FreeCAD stores inside an .FCStd and
+    // what BRepTools writes. Sniffing the header beats trying-and-retrying: a
+    // failed BinTools::Read leaves the stream in an unusable state, and the ASCII
+    // magic is fixed and cheap to spot.
+    const std::string head(
+        reinterpret_cast<const char*>(data.data()),
+        std::min<size_t>(data.size(), 64));
+    const bool ascii = head.find("CASCADE Topology V") != std::string::npos;
+
     try {
-        BinTools::Read(*shape, iss);
+        if (ascii) {
+            BRep_Builder builder;
+            BRepTools::Read(*shape, iss, builder);
+        } else {
+            BinTools::Read(*shape, iss);
+        }
     } catch (const Standard_Failure&) {
         return nullptr;  // out_consumed deliberately untouched
     }
