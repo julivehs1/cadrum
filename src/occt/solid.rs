@@ -390,7 +390,7 @@ impl SolidStruct for Solid {
 			ffi::edge_vec_push(edge_vec.pin_mut(), &e.inner);
 		}
 		let mut history = History::default();
-		let shape = ffi::builder_fillet(&self.inner, &edge_vec, radius, &mut history.faces, &mut history.edges, &mut history.gen_edges);
+		let shape = ffi::builder_fillet(&self.inner, &edge_vec, radius, &mut history.faces, &mut history.edges, &mut history.gen_faces, &mut history.gen_edges);
 		if shape.is_null() {
 			return Err(Error::FilletFailed);
 		}
@@ -410,7 +410,7 @@ impl SolidStruct for Solid {
 			ffi::edge_vec_push(edge_vec.pin_mut(), &e.inner);
 		}
 		let mut history = History::default();
-		let shape = ffi::builder_chamfer(&self.inner, &edge_vec, distance, &mut history.faces, &mut history.edges, &mut history.gen_edges);
+		let shape = ffi::builder_chamfer(&self.inner, &edge_vec, distance, &mut history.faces, &mut history.edges, &mut history.gen_faces, &mut history.gen_edges);
 		if shape.is_null() {
 			return Err(Error::ChamferFailed);
 		}

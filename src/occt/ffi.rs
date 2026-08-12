@@ -83,8 +83,8 @@ mod ffi_bridge {
 		// shell/fillet/chamfer fill `out_history`(face) + `out_edge_history`(edge)
 		// with flat [post_id, src_id] pairs → Solid::history + colormap remap.
 		fn builder_thick_solid(solid: &TopoDS_Shape, open_faces: &CxxVector<TopoDS_Face>, thickness: f64, out_history: &mut Vec<u64>, out_edge_history: &mut Vec<u64>) -> UniquePtr<TopoDS_Shape>;
-		fn builder_fillet(solid: &TopoDS_Shape, edges: &CxxVector<TopoDS_Edge>, radius: f64, out_history: &mut Vec<u64>, out_edge_history: &mut Vec<u64>, out_gen_edges: &mut Vec<u64>) -> UniquePtr<TopoDS_Shape>;
-		fn builder_chamfer(solid: &TopoDS_Shape, edges: &CxxVector<TopoDS_Edge>, distance: f64, out_history: &mut Vec<u64>, out_edge_history: &mut Vec<u64>, out_gen_edges: &mut Vec<u64>) -> UniquePtr<TopoDS_Shape>;
+		fn builder_fillet(solid: &TopoDS_Shape, edges: &CxxVector<TopoDS_Edge>, radius: f64, out_history: &mut Vec<u64>, out_edge_history: &mut Vec<u64>, out_gen_faces: &mut Vec<u64>, out_gen_edges: &mut Vec<u64>) -> UniquePtr<TopoDS_Shape>;
+		fn builder_chamfer(solid: &TopoDS_Shape, edges: &CxxVector<TopoDS_Edge>, distance: f64, out_history: &mut Vec<u64>, out_edge_history: &mut Vec<u64>, out_gen_faces: &mut Vec<u64>, out_gen_edges: &mut Vec<u64>) -> UniquePtr<TopoDS_Shape>;
 
 		// ==================== Transforms (solid → solid, no history) ====================
 

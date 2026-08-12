@@ -116,6 +116,7 @@
 #include <cstring>
 #include <cstdint>
 #include <algorithm>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
@@ -671,26 +672,46 @@ static void emit_builder_history(
     relay_into_history(&re, nullptr, out_edges);
 }
 
-// Emit **Generated** edge pairs [gen_edge, src_edge] for a fillet/chamfer maker:
-// for each original edge, the maker's Generated() gives the blend face(s) it
-// spawned; every edge of those faces is "generated from" that original edge.
-// These are the brand-new blend-boundary edges that no Modified() relation
-// covers — the ones a fully-filleted part exposes to picking.
+// Emit **Generated** pairs for a fillet/chamfer maker: for each original edge,
+// the maker's Generated() gives the blend face(s) it spawned. That face IS the
+// thing the operation created — [gen_face, src_edge] — and every edge bounding
+// it is generated from the same original edge — [gen_edge, src_edge]. Both are
+// brand-new and no Modified() relation covers them; they are what a fully
+// filleted part exposes to picking.
+//
+// The face half used to be walked and thrown away: the loop already had the
+// blend face in hand and only emitted its edges. A caller asking "which faces
+// did my fillet just make?" had to go back to geometry for an answer the
+// builder had already given.
 template <typename Builder>
 static void emit_generated_edges(
     Builder& builder,
     const TopoDS_Shape& src,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges)
 {
+    // MEASURED: `TopExp_Explorer` over a solid's EDGEs walks shell→face→wire→
+    // edge and therefore yields every edge ONCE PER ADJACENT FACE — a filleted
+    // cube edge came back with two identical [blend_face, src_edge] pairs. The
+    // edge table has always had those duplicates too (the Rust side sorts and
+    // dedups, so nobody noticed); a pair set keeps both halves honest at the
+    // source instead.
+    std::set<std::pair<uint64_t, uint64_t>> emitted;
+    auto emit = [&](rust::Vec<uint64_t>& out, uint64_t gen_id, uint64_t src_id) {
+        if (!emitted.insert({gen_id, src_id}).second) return;
+        out.push_back(gen_id);
+        out.push_back(src_id);
+    };
     for (TopExp_Explorer ex(src, TopAbs_EDGE); ex.More(); ex.Next()) {
         const TopoDS_Shape& e = ex.Current();
         uint64_t src_id = subshape_id(e);
         const NCollection_List<TopoDS_Shape>& gen = builder.Generated(e);
         for (NCollection_List<TopoDS_Shape>::Iterator it(gen); it.More(); it.Next()) {
+            if (it.Value().ShapeType() == TopAbs_FACE) {
+                emit(out_gen_faces, subshape_id(it.Value()), src_id);
+            }
             for (TopExp_Explorer ge(it.Value(), TopAbs_EDGE); ge.More(); ge.Next()) {
-                uint64_t ge_id = subshape_id(ge.Current());
-                out_gen_edges.push_back(ge_id);
-                out_gen_edges.push_back(src_id);
+                emit(out_gen_edges, subshape_id(ge.Current()), src_id);
             }
         }
     }
@@ -1825,6 +1846,7 @@ std::unique_ptr<TopoDS_Shape> builder_fillet(
     double radius,
     rust::Vec<uint64_t>& out_history,
     rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges)
 {
     try {
@@ -1852,7 +1874,7 @@ std::unique_ptr<TopoDS_Shape> builder_fillet(
         // No copy, so relay keys are final faces/edges (identity for untouched).
         emit_builder_history(mk, solid, out_history, out_edge_history);
         // Blend-boundary edges (the new ones a filleted part exposes) → source edge.
-        emit_generated_edges(mk, solid, out_gen_edges);
+        emit_generated_edges(mk, solid, out_gen_faces, out_gen_edges);
         return std::make_unique<TopoDS_Shape>(result);
     } catch (const Standard_Failure&) {
         return nullptr;
@@ -1865,6 +1887,7 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
     double distance,
     rust::Vec<uint64_t>& out_history,
     rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges)
 {
     try {
@@ -1892,7 +1915,7 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
         // No copy, so relay keys are final faces/edges (identity for untouched).
         emit_builder_history(mk, solid, out_history, out_edge_history);
         // Chamfer bevel-boundary edges (new) → source edge.
-        emit_generated_edges(mk, solid, out_gen_edges);
+        emit_generated_edges(mk, solid, out_gen_faces, out_gen_edges);
         return std::make_unique<TopoDS_Shape>(result);
     } catch (const Standard_Failure&) {
         return nullptr;

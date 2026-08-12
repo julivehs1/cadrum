@@ -169,7 +169,9 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
 // tangent discontinuity, edges not belonging to `solid`, etc.).
 //
 // `out_history`/`out_edge_history`: flat [post_id, src_id] face/edge pairs
-// (Modified(), identity for untouched). `out_gen_edges`: flat [gen_edge, src_edge]
+// (Modified(), identity for untouched). `out_gen_faces`: flat [gen_face, src_edge]
+// pairs — the blend/bevel faces the operation CREATED, keyed by the edge they
+// grew from. `out_gen_edges`: flat [gen_edge, src_edge]
 // pairs for the new blend-boundary edges (Generated()) ← the filleted edge.
 std::unique_ptr<TopoDS_Shape> builder_fillet(
     const TopoDS_Shape& solid,
@@ -177,6 +179,7 @@ std::unique_ptr<TopoDS_Shape> builder_fillet(
     double radius,
     rust::Vec<uint64_t>& out_history,
     rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges);
 
 // Chamfer (symmetric bevel) the given edges of `solid` with a uniform
@@ -186,7 +189,9 @@ std::unique_ptr<TopoDS_Shape> builder_fillet(
 // `solid`, etc.).
 //
 // `out_history`/`out_edge_history`: flat [post_id, src_id] face/edge pairs
-// (Modified(), identity for untouched). `out_gen_edges`: flat [gen_edge, src_edge]
+// (Modified(), identity for untouched). `out_gen_faces`: flat [gen_face, src_edge]
+// pairs — the blend/bevel faces the operation CREATED, keyed by the edge they
+// grew from. `out_gen_edges`: flat [gen_edge, src_edge]
 // pairs for the new bevel-boundary edges (Generated()) ← the chamfered edge.
 std::unique_ptr<TopoDS_Shape> builder_chamfer(
     const TopoDS_Shape& solid,
@@ -194,6 +199,7 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
     double distance,
     rust::Vec<uint64_t>& out_history,
     rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_faces,
     rust::Vec<uint64_t>& out_gen_edges);
 
 // ==================== Transforms (solid → solid, no history) ====================

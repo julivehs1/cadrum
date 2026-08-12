@@ -602,3 +602,31 @@ fn test_extrude_with_holes_orients_either_winding() {
 	assert!((b.volume() - want).abs() < 1e-6, "entgegengesetzter Umlaufsinn: {} statt {want}", b.volume());
 	assert!(b.is_valid());
 }
+
+/// **Was eine Verrundung erzeugt, sagt sie jetzt auch** — die Blend-Fläche,
+/// nicht nur ihre Kanten.
+///
+/// `Generated(edge)` liefert die Blend-Fläche, die aus einer verrundeten Kante
+/// gewachsen ist. Die Schleife hatte sie längst in der Hand und meldete nur ihre
+/// **Kanten** weiter; wer fragte „welche Flächen hat mein Fillet gerade
+/// gemacht?", musste dafür zurück in die Geometrie — für eine Antwort, die der
+/// Builder schon gegeben hatte.
+#[test]
+fn test_fillet_reports_the_faces_it_generated() {
+	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
+	let edge = cube.iter_edge().next().expect("cube has edges");
+	let edge_id = edge.id();
+	let before: HashSet<u64> = cube.iter_face().map(|f| f.id()).collect();
+
+	let filleted = cube.fillet_edges(1.0, [edge]).expect("fillet");
+	let gen: Vec<[u64; 2]> = filleted.iter_generated_faces().collect();
+	assert_eq!(gen.len(), 1, "eine verrundete Kante wächst zu einer Blend-Fläche");
+
+	let [face, src] = gen[0];
+	assert_eq!(src, edge_id, "die Quelle ist die verrundete Kante");
+	// Es ist wirklich eine Fläche des Ergebnisses …
+	let after: HashSet<u64> = filleted.iter_face().map(|f| f.id()).collect();
+	assert!(after.contains(&face), "die gemeldete Blend-Fläche gehört zum Ergebnis");
+	// … und sie ist neu, nicht eine umbenannte alte.
+	assert!(!before.contains(&face), "sie ist neu geboren, nicht Modified");
+}
