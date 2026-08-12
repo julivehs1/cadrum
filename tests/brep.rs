@@ -36,3 +36,17 @@ fn read_brep_with_trailing_garbage() {
 		}
 	}
 }
+
+/// The reader picks its flavour from the header, and the two magics nest: the binary
+/// one CONTAINS the ASCII one. This pins the trap, because a sniff that looks for the
+/// short magic first routes every binary file into the ASCII reader — which rejects it
+/// with "File was not written with this version of the topology".
+#[test]
+fn the_binary_header_contains_the_ascii_magic() {
+	let mut buf = Vec::new();
+	cadrum::Solid::write_brep(&test_box(), &mut buf).expect("write_brep should succeed");
+	let head = String::from_utf8_lossy(&buf[..64.min(buf.len())]).into_owned();
+
+	assert!(head.contains("Open CASCADE Topology V"), "binary magic moved: {head:?}");
+	assert!(head.contains("CASCADE Topology V"), "the ASCII magic is a substring of it: {head:?}");
+}

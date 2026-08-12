@@ -269,14 +269,21 @@ std::unique_ptr<TopoDS_Shape> read_brep_stream(
     auto shape = std::make_unique<TopoDS_Shape>();
 
     // Two BREP flavours share the extension. BinTools is what we write; the ASCII
-    // form ("CASCADE Topology V<n>") is what FreeCAD stores inside an .FCStd and
-    // what BRepTools writes. Sniffing the header beats trying-and-retrying: a
-    // failed BinTools::Read leaves the stream in an unusable state, and the ASCII
-    // magic is fixed and cheap to spot.
+    // form is what FreeCAD stores inside an .FCStd and what BRepTools writes.
+    // Sniffing the header beats trying-and-retrying: a failed BinTools::Read leaves
+    // the stream in an unusable state, and both magics stand in the first bytes.
+    //
+    // Careful, the two magics nest. Binary opens with "\nOpen CASCADE Topology V4,
+    // (c) Open Cascade\n"; ASCII carries "CASCADE Topology V3, (c) Open Cascade"
+    // after its "DBRep_DrawableShape" line. Searching for the shorter one first
+    // therefore calls EVERY binary file ASCII, and the ASCII reader then rejects V4
+    // with the misleading "File was not written with this version of the topology".
+    // So the longer, binary-only magic decides, and only its absence leaves ASCII.
     const std::string head(
         reinterpret_cast<const char*>(data.data()),
         std::min<size_t>(data.size(), 64));
-    const bool ascii = head.find("CASCADE Topology V") != std::string::npos;
+    const bool binary = head.find("Open CASCADE Topology V") != std::string::npos;
+    const bool ascii = !binary && head.find("CASCADE Topology V") != std::string::npos;
 
     try {
         if (ascii) {
