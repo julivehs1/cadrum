@@ -1755,7 +1755,8 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
     const std::vector<TopoDS_Face>& open_faces,
     double thickness,
     rust::Vec<uint64_t>& out_history,
-    rust::Vec<uint64_t>& out_edge_history)
+    rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_faces)
 {
     try {
         // Empty open_faces: MakeThickSolidByJoin degenerates to a plain offset
@@ -1817,12 +1818,25 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
         // No copy, so relay keys are final faces.
         Relay relay;
         relay_from_builder(builder, solid, TopAbs_FACE, relay);
-        // MakeThickSolid does not flag removed open faces as IsDeleted; drop
-        // their (identity) pairs since those faces are absent from the result.
-        for (const auto& f : open_faces) {
-            uint64_t removed_id = subshape_id(f);
-            for (auto it = relay.begin(); it != relay.end(); ) {
-                if (it->second == removed_id) it = relay.erase(it);
+        // MakeThickSolid does not flag removed open faces as IsDeleted, so their
+        // identity pairs have to be dropped by hand. Dropping them BY SOURCE ID
+        // is wrong, and measurably so: the two caps of a swept solid share one
+        // TShape id (by design, see subshape_id), so opening the top erased the
+        // bottom's provenance with it — a prism reported four retained faces
+        // where a cube reported five. Hollowing a tub is the single most common
+        // shell there is, and its floor lost its name and its colour.
+        //
+        // Dropped by RESULT id instead: a face that is not in the result cannot
+        // be a post id. That covers the ordinary case and the shared-id one at
+        // once — the shared id IS live (the floor is still there), so the entry
+        // stays and lands on the face that survived.
+        {
+            std::unordered_set<uint64_t> live;
+            for (TopExp_Explorer fx(builder.Shape(), TopAbs_FACE); fx.More(); fx.Next()) {
+                live.insert(subshape_id(fx.Current()));
+            }
+            for (auto it = relay.begin(); it != relay.end();) {
+                if (live.count(it->first) == 0) it = relay.erase(it);
                 else ++it;
             }
         }
@@ -1834,6 +1848,30 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
         Relay relay_e;
         relay_from_builder(builder, solid, TopAbs_EDGE, relay_e);
         relay_into_history(&relay_e, nullptr, out_edge_history);
+        // **Die Innenwand hat bis hierher gar keine Herkunft gehabt.** Sie ist
+        // weder Modified noch identity — sie wird GENERIERT, aus der Außenfläche,
+        // die versetzt wurde. Ohne diese Tabelle konnte ein Aufrufer nach dem
+        // Aufschalen nicht sagen, welche Fläche die Innenseite welcher Wand ist,
+        // und jede vorher geschriebene Trefferzahl stimmte nicht mehr.
+        //
+        // `src` ist hier eine FLÄCHE, nicht eine Kante wie bei extrude/fillet —
+        // welche Sorte die Quelle hat, hängt an der Operation, und der Aufrufer
+        // weiß es, weil er sie gerade gerufen hat.
+        {
+            std::set<std::pair<uint64_t, uint64_t>> emitted;
+            for (TopExp_Explorer fx(solid, TopAbs_FACE); fx.More(); fx.Next()) {
+                const TopoDS_Shape& f = fx.Current();
+                uint64_t src_id = subshape_id(f);
+                const NCollection_List<TopoDS_Shape>& gen = builder.Generated(f);
+                for (NCollection_List<TopoDS_Shape>::Iterator it(gen); it.More(); it.Next()) {
+                    if (it.Value().ShapeType() != TopAbs_FACE) continue;
+                    uint64_t gen_id = subshape_id(it.Value());
+                    if (!emitted.insert({gen_id, src_id}).second) continue;
+                    out_gen_faces.push_back(gen_id);
+                    out_gen_faces.push_back(src_id);
+                }
+            }
+        }
         return std::make_unique<TopoDS_Shape>(builder.Shape());
     } catch (const Standard_Failure&) {
         return nullptr;

@@ -154,14 +154,18 @@ std::unique_ptr<TopoDS_Shape> builder_clean(
 // failure (e.g. self-intersecting offset at sharp corners).
 //
 // `out_history`/`out_edge_history`: flat [post_id, src_id] face/edge-derivation
-// pairs (Modified(), identity for pass-through). Generated walls have no
-// face/edge source, absent.
+// pairs (Modified(), identity for pass-through).
+// `out_gen_faces`: flat [gen_face, src_face] — the offset (inner) walls, keyed
+// by the outer face each was generated from. They are neither Modified nor
+// identity, so without this table the hollow side of a shelled part has no
+// provenance at all.
 std::unique_ptr<TopoDS_Shape> builder_thick_solid(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Face>& open_faces,
     double thickness,
     rust::Vec<uint64_t>& out_history,
-    rust::Vec<uint64_t>& out_edge_history);
+    rust::Vec<uint64_t>& out_edge_history,
+    rust::Vec<uint64_t>& out_gen_faces);
 
 // Fillet the given edges of `solid` with a uniform radius using
 // BRepFilletAPI_MakeFillet. Empty `edges` is a no-op (returns a shallow

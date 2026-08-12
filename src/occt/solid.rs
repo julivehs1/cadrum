@@ -368,7 +368,7 @@ impl SolidStruct for Solid {
 			ffi::face_vec_push(face_vec.pin_mut(), &f.inner);
 		}
 		let mut history = History::default();
-		let shape = ffi::builder_thick_solid(&self.inner, &face_vec, thickness, &mut history.faces, &mut history.edges);
+		let shape = ffi::builder_thick_solid(&self.inner, &face_vec, thickness, &mut history.faces, &mut history.edges, &mut history.gen_faces);
 		if shape.is_null() {
 			return Err(Error::ShellFailed);
 		}

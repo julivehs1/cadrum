@@ -45,8 +45,19 @@ fn test_no_face_source_ops_have_empty_history() {
 }
 
 /// shell: cube の top を開けて内側 offset。残り 5 面は Modified されて outer wall
-/// になる。除去された top は Deleted で history に出ない。inner wall は Generated
-/// なので出ない。
+/// になる。
+///
+/// **Korrigiert 2026-08**: bis dahin stand hier „除去された top は Deleted で
+/// history に出ない" und `srcs.len() == 5`. Das war nicht OCCTs Auskunft,
+/// sondern die Folge einer Lösch-Schleife in `builder_thick_solid`, die das
+/// Paar der geöffneten Fläche von Hand entfernte. OCCT meldet
+/// `Modified(top) → Rand an der Öffnung`, und das stimmt: das Band, das an der
+/// Öffnung stehen bleibt, IST der Rest der abgenommenen Deckfläche. Sechs
+/// Quellen, nicht fünf.
+///
+/// Die Lösch-Schleife musste ohnehin weg — sie ging über die Quell-Id und
+/// löschte damit an einem Prisma den Boden mit
+/// (`test_shell_history_survives_the_shared_cap_id`).
 #[test]
 fn test_shell_history_maps_five_retained_faces() {
 	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
@@ -61,8 +72,12 @@ fn test_shell_history_maps_five_retained_faces() {
 		assert!(original.contains(src), "src {src} is not an original cube face");
 	}
 	let srcs: HashSet<u64> = hist.iter().map(|[_, s]| *s).collect();
-	assert_eq!(srcs.len(), 5, "5 retained faces should map (top removed); got {}", srcs.len());
-	assert!(!srcs.contains(&top_id), "removed top face must not appear as src");
+	assert_eq!(srcs.len(), 6, "5 behaltene Flächen + die geöffnete (→ Rand); got {}", srcs.len());
+	assert!(srcs.contains(&top_id), "die geöffnete Fläche wird zum Rand an der Öffnung");
+	// Und ihr Bild ist NICHT sie selbst: sie ist verschwunden, der Rand ist neu.
+	let rim: Vec<u64> = hist.iter().filter(|[_, s]| *s == top_id).map(|[p, _]| *p).collect();
+	assert_eq!(rim.len(), 1, "genau ein Rand");
+	assert_ne!(rim[0], top_id, "der Rand ist eine andere Fläche als die Deckfläche");
 }
 
 /// fillet: cube の edge 1 本を fillet → その edge を共有する 2 面が Modified
@@ -629,4 +644,81 @@ fn test_fillet_reports_the_faces_it_generated() {
 	assert!(after.contains(&face), "die gemeldete Blend-Fläche gehört zum Ergebnis");
 	// … und sie ist neu, nicht eine umbenannte alte.
 	assert!(!before.contains(&face), "sie ist neu geboren, nicht Modified");
+}
+
+/// **Die Innenwand eines aufgeschalten Körpers hatte gar keine Herkunft.**
+///
+/// `shell` versetzt die behaltenen Flächen nach innen. Die Außenseite ist
+/// `Modified` (steht in `iter_history`), die **Innenseite** ist weder Modified
+/// noch identity — sie wird `Generated`, aus genau der Außenfläche, die
+/// versetzt wurde. Diese Tabelle fehlte („Generated walls have no face/edge
+/// source, absent", wrapper.h), und damit konnte ein Aufrufer nach dem
+/// Aufschalen nicht sagen, welche Fläche die Innenseite welcher Wand ist.
+///
+/// GEMESSEN am gedeckelten Würfel: 11 Ergebnisflächen = 5 versetzte Außenwände
+/// + 5 Innenwände + 1 Rand an der Öffnung. Die beiden Tabellen sind
+/// überschneidungsfrei und decken zusammen **alle elf** — der Rand ist
+/// `Modified(geöffnete Fläche)`, was genau stimmt: das Band an der Öffnung ist,
+/// was von der abgenommenen Deckfläche übrig blieb.
+#[test]
+fn test_shell_reports_the_inner_walls_it_generated() {
+	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(20.0));
+	let before: HashSet<u64> = cube.iter_face().map(|f| f.id()).collect();
+	let open = cube.iter_face().last().expect("cube has faces");
+	let open_id = open.id();
+
+	let shelled = cube.shell(-2.0, [open]).expect("shell");
+	let after: HashSet<u64> = shelled.iter_face().map(|f| f.id()).collect();
+	assert_eq!(after.len(), 11, "5 außen + 5 innen + 1 Rand");
+
+	let gen: Vec<[u64; 2]> = shelled.iter_generated_faces().collect();
+	assert_eq!(gen.len(), 5, "eine Innenwand je behaltener Fläche");
+	for [inner, src] in &gen {
+		assert!(after.contains(inner), "die Innenwand gehört zum Ergebnis");
+		assert!(before.contains(src), "ihre Quelle ist eine Fläche des Originals");
+	}
+	assert!(!gen.iter().any(|[_, s]| *s == open_id), "die geöffnete Fläche erzeugt keine Innenwand");
+
+	// Außen und innen sind verschiedene Flächen, und beide Tabellen zusammen
+	// erklären ALLE elf: die sechste Modified-Beziehung ist die geöffnete
+	// Fläche → der Rand an der Öffnung, und das stimmt.
+	let outer: HashSet<u64> = shelled.iter_history().map(|[p, _]| p).collect();
+	let inner: HashSet<u64> = gen.iter().map(|[p, _]| *p).collect();
+	assert_eq!(outer.len(), 6, "5 behaltene Flächen plus der Rand");
+	assert!(shelled.iter_history().any(|[_, s]| s == open_id), "der Rand kommt von der Öffnung");
+	assert_eq!(outer.intersection(&inner).count(), 0, "keine Fläche ist beides");
+	assert_eq!(outer.union(&inner).count(), 11, "zusammen erklären sie jede Fläche");
+}
+
+/// **Die Kappen teilen eine Id — also darf man die Herkunft nicht über sie
+/// löschen.**
+///
+/// `MakeThickSolid` markiert die abgenommene Fläche nicht als `IsDeleted`, ihr
+/// Identitäts-Paar musste also von Hand weg. Das geschah über die **Quell-Id**
+/// — und Deckel und Boden eines Sweeps teilen sich genau diese (by design,
+/// `subshape_id`). Wer oben öffnete, löschte damit die Herkunft des Bodens mit:
+/// der Würfel meldete fünf behaltene Flächen, das Prisma vier. Eine Wanne
+/// auszuhöhlen ist der häufigste `shell` überhaupt, und ihr Boden verlor dabei
+/// Namen und Farbe.
+///
+/// Gelöscht wird jetzt über die **Ergebnis-Id**: was nicht im Ergebnis steht,
+/// kann kein `post` sein. Das deckt beide Fälle auf einmal ab.
+#[test]
+fn test_shell_history_survives_the_shared_cap_id() {
+	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(20.0));
+	let prism = Solid::extrude(&square(20.0), DVec3::new(0.0, 0.0, 20.0)).expect("prism");
+	assert_eq!(cube.iter_face().map(|f| f.id()).collect::<HashSet<_>>().len(), 6, "Primitiv: sechs Ids");
+	assert_eq!(prism.iter_face().map(|f| f.id()).collect::<HashSet<_>>().len(), 5, "Sweep: die Kappen teilen eine");
+
+	// Beide oben öffnen und aufschalen — beide müssen dieselbe Auskunft geben.
+	fn top_of(s: &Solid) -> &cadrum::Face {
+		let hi = |f: &cadrum::Face| f.iter_edge().flat_map(|e| e.approximation_segments(Default::default())).map(|p| p.z).fold(f64::MIN, f64::max);
+		s.iter_face().max_by(|a, b| hi(a).total_cmp(&hi(b))).expect("faces")
+	}
+	for (label, solid) in [("Würfel", cube), ("Prisma", prism)] {
+		let open = top_of(&solid);
+		let shelled = solid.shell(-2.0, [open]).expect("shell");
+		assert_eq!(shelled.iter_history().count(), 6, "{label}: fünf behaltene Flächen plus der Rand");
+		assert_eq!(shelled.iter_generated_faces().count(), 5, "{label}: fünf Innenwände");
+	}
 }
