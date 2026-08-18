@@ -665,6 +665,11 @@ impl SolidStruct for Solid {
 		super::io::read_step(reader)
 	}
 
+	#[cfg(feature = "color")]
+	fn read_step_assembly<R: std::io::Read>(reader: &mut R) -> Result<(Vec<String>, Vec<crate::traits::StepOccurrence<Self>>), Error> {
+		super::io::read_step_assembly(reader)
+	}
+
 	fn read_brep<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self>, Error> {
 		super::io::read_brep(reader)
 	}

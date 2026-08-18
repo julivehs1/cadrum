@@ -106,7 +106,28 @@ use crate::common::boolean::Boolean;
 use crate::common::color::Color;
 use crate::common::error::Error;
 use crate::common::mesh::Mesh;
+#[cfg(feature = "color")]
+use glam::DMat4;
 use glam::{DMat3, DQuat, DVec3};
+
+/// One SOLID as the STEP product structure names and places it — the half of an
+/// assembly file `read_step` drops. Returned by `Solid::read_step_assembly`.
+#[cfg(feature = "color")]
+pub struct StepOccurrence<S> {
+	/// The solid, already moved into assembly coordinates.
+	pub solid: S,
+	/// Occurrence path joined by `/`, e.g. `Z-Axis Assembly/M4 Nut v1 (3)`.
+	pub path: String,
+	/// Index into the product names returned alongside. Two occurrences of one
+	/// product share it, and that is the bill of materials.
+	pub product: u32,
+	/// Where the occurrence sits. `solid` is already moved by it; it is kept
+	/// because a re-used product is placed by exactly this matrix.
+	pub placement: DMat4,
+	/// The style the file carries, if any. Per solid — a per-face style in the
+	/// file is not represented here.
+	pub color: Option<Color>,
+}
 
 /// Tessellation parameters for `Solid::mesh` and `Edge::approximation_segments`.
 ///
@@ -820,6 +841,11 @@ pub trait SolidStruct: Sized + Clone + Transform {
 	// solids. Putting them on Solid concentrates the type's surface and keeps
 	// the crate root free of generic names like `mesh` / `write_step`.
 	fn read_step<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self>, Error>;
+	/// The same file with its product structure kept: the product names, and one
+	/// [`StepOccurrence`] per solid naming and placing it. `read_step` is this
+	/// minus the names — an assembly read that way is anonymous solids.
+	#[cfg(feature = "color")]
+	fn read_step_assembly<R: std::io::Read>(reader: &mut R) -> Result<(Vec<String>, Vec<StepOccurrence<Self>>), Error>;
 	/// BRep is OCCT's `BinTools` binary format. The ASCII `BRepTools` flavour is not
 	/// supported — see `notes/20260714-BRep_textを捨てて前置マジックに移行.md`.
 	fn read_brep<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self>, Error>;

@@ -567,6 +567,27 @@ bool write_step_color_stream(
     rust::Slice<const float>    rgb,
     RustWriter&                 writer);
 
+// ==================== STEP assembly structure ====================
+
+// The product structure a plain read drops: PRODUCT names and
+// NEXT_ASSEMBLY_USAGE_OCCURRENCE placements. The returned compound holds one
+// SOLID per child, in the same order as every out-vector, so the caller can zip
+// them without a shared key — a TShape* cannot serve as one here, because two
+// occurrences of the same product share it.
+//
+// `out_products` = every distinct product name once. Per solid:
+// `out_product` indexes it, `out_path` is the occurrence path joined by '/',
+// `out_placement` is 12 doubles (row-major 3x4) and `out_color` is r,g,b,a with
+// a = 0 for "no style in the file".
+// Returns nullptr on failure.
+std::unique_ptr<TopoDS_Shape> read_step_assembly_stream(
+    RustReader&              reader,
+    rust::Vec<rust::String>& out_products,
+    rust::Vec<uint32_t>&     out_product,
+    rust::Vec<rust::String>& out_path,
+    rust::Vec<double>&       out_placement,
+    rust::Vec<float>&        out_color);
+
 } // namespace cadrum
 
 #endif // CADRUM_COLOR

@@ -133,6 +133,57 @@ pub(super) fn read_brep<R: Read>(reader: &mut R) -> Result<Vec<Solid>, Error> {
 	}
 }
 
+/// The same read, with the product structure the plain one drops.
+///
+/// Order is the contract: the compound comes back with one SOLID per child in
+/// the order every metadata vector uses. A TShape* cannot key this — two
+/// occurrences of one product share it.
+#[cfg(feature = "color")]
+pub(super) fn read_step_assembly<R: Read>(reader: &mut R) -> Result<(Vec<String>, Vec<crate::traits::StepOccurrence<Solid>>), Error> {
+	use glam::{DMat4, DVec4};
+
+	let mut rust_reader = RustReader::from_ref(reader);
+	let mut products: Vec<String> = Default::default();
+	let mut product: Vec<u32> = Default::default();
+	let mut paths: Vec<String> = Default::default();
+	let mut placements: Vec<f64> = Default::default();
+	let mut colors: Vec<f32> = Default::default();
+	let inner = ffi::read_step_assembly_stream(&mut rust_reader, &mut products, &mut product, &mut paths, &mut placements, &mut colors);
+	if inner.is_null() {
+		return Err(Error::StepReadFailed);
+	}
+
+	let shapes = ffi::decompose_into_solids(&inner);
+	if shapes.len() != product.len() {
+		return Err(Error::StepReadFailed);
+	}
+
+	let occurrences = shapes
+		.iter()
+		.zip(product)
+		.zip(paths)
+		.enumerate()
+		.map(|(i, ((shape, product), path))| {
+			// Row-major 3x4 out of `gp_Trsf::Value`, into glam's column-major.
+			let p = &placements[i * 12..i * 12 + 12];
+			let placement = DMat4::from_cols(DVec4::new(p[0], p[4], p[8], 0.0), DVec4::new(p[1], p[5], p[9], 0.0), DVec4::new(p[2], p[6], p[10], 0.0), DVec4::new(p[3], p[7], p[11], 1.0));
+
+			let c = &colors[i * 4..i * 4 + 4];
+			let color = (c[3] != 0.0).then_some(Color { r: c[0], g: c[1], b: c[2] });
+			// Keyed by TShape*, so two differently styled occurrences of one
+			// product would collide here; `StepOccurrence::color` is the honest one.
+			let mut colormap = std::collections::HashMap::new();
+			if let Some(c) = color {
+				colormap.insert(ffi::shape_tshape_id(shape), c);
+			}
+
+			crate::traits::StepOccurrence { solid: Solid::new(ffi::clone_shape_handle(shape), colormap, Default::default()), path, product, placement, color }
+		})
+		.collect();
+
+	Ok((products, occurrences))
+}
+
 /// Write solids to a STEP stream.
 ///
 /// With the `color` feature enabled, face colors are automatically embedded

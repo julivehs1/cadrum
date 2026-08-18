@@ -191,3 +191,22 @@ fn single_source_ops_carry_the_solid_color() {
 		assert_eq!(solid.colormap().get(&solid.id()).copied(), Some(red), "{name} must carry the solid colour across");
 	}
 }
+
+/// The assembly reader must return exactly as many occurrences as the plain
+/// reader returns solids, in the same order — that order is the only key tying
+/// a solid to its name, since two occurrences of one product share a TShape*.
+#[test]
+fn read_step_assembly_matches_read_step_order() {
+	let data = fs::read(COLORED_BOX_STEP).expect("steps/colored_box.step should exist");
+	let plain = Solid::read_step(&mut data.as_slice()).expect("read_step should succeed");
+	let (products, occurrences) = Solid::read_step_assembly(&mut data.as_slice()).expect("read_step_assembly should succeed");
+
+	assert_eq!(occurrences.len(), plain.len());
+	assert!(!products.is_empty(), "a STEP file always names at least its one product");
+	for (o, p) in occurrences.iter().zip(&plain) {
+		assert!((o.solid.volume() - p.volume()).abs() < 1e-6, "{} vs {}", o.solid.volume(), p.volume());
+		assert!((o.product as usize) < products.len());
+		// A flat file has no NEXT_ASSEMBLY_USAGE_OCCURRENCE, so nothing is moved.
+		assert_eq!(o.placement, glam::DMat4::IDENTITY);
+	}
+}

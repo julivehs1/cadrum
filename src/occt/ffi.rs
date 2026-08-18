@@ -68,6 +68,11 @@ mod ffi_bridge {
 		#[cfg(feature = "color")]
 		fn write_step_color_stream(shape: &TopoDS_Shape, ids: &[u64], rgb: &[f32], writer: &mut RustWriter) -> bool;
 
+		// 返る compound の子は SOLID 一つずつで、全 out_* と同じ並び。同じ product の
+		// 二つの occurrence は TShape* を共有するので、キーではなく順序で結ぶ。
+		#[cfg(feature = "color")]
+		fn read_step_assembly_stream(reader: &mut RustReader, out_products: &mut Vec<String>, out_product: &mut Vec<u32>, out_path: &mut Vec<String>, out_placement: &mut Vec<f64>, out_color: &mut Vec<f32>) -> UniquePtr<TopoDS_Shape>;
+
 		// ==================== Builders (solid → solid with history) ====================
 
 		// Evaluate any boolean expression on N solids via BOPAlgo_CellsBuilder.

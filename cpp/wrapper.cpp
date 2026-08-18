@@ -2527,6 +2527,8 @@ std::unique_ptr<TopoDS_Shape> make_bspline_solid(
 #include <TDF_ChildIterator.hxx>
 #include <NCollection_Sequence.hxx>
 #include <TDF_Label.hxx>
+#include <TDF_Tool.hxx>
+#include <TDataStd_Name.hxx>
 #include <Quantity_Color.hxx>
 
 namespace cadrum {
@@ -2629,6 +2631,189 @@ std::unique_ptr<TopoDS_Shape> read_step_color_stream(
         }
 
         return std::make_unique<TopoDS_Shape>(post);
+    } catch (const Standard_Failure&) {
+        return nullptr;
+    }
+}
+
+// ==================== STEP assembly structure ====================
+
+// The 0 replacement character selects UTF-8 conversion over substitution. STEP
+// names carry non-ASCII routinely: `\X\D6\X\E1` escapes decode to CJK.
+static std::string label_name(const TDF_Label& label) {
+    Handle(TDataStd_Name) attr;
+    if (!label.FindAttribute(TDataStd_Name::GetID(), attr)) return std::string();
+    TCollection_AsciiString utf8(attr->Get());
+    return std::string(utf8.ToCString(), (size_t)utf8.Length());
+}
+
+static bool label_color(
+    const Handle(XCAFDoc_ColorTool)& colorTool,
+    const TDF_Label&                 label,
+    Quantity_Color&                  out)
+{
+    return colorTool->GetColor(label, XCAFDoc_ColorSurf, out)
+        || colorTool->GetColor(label, XCAFDoc_ColorGen, out);
+}
+
+// Everything the walk below writes to, so the recursion carries one reference.
+struct AssemblyOut {
+    rust::Vec<rust::String>& products;
+    rust::Vec<uint32_t>&     product;
+    rust::Vec<rust::String>& path;
+    rust::Vec<double>&       placement;
+    rust::Vec<float>&        color;
+    BRep_Builder&            builder;
+    TopoDS_Compound&         compound;
+    std::unordered_map<std::string, uint32_t> index;  // TDF entry -> product
+};
+
+static void emit_solids(
+    const TDF_Label&                 productLabel,
+    const std::string&               path,
+    const TopLoc_Location&           loc,
+    const Quantity_Color*            inherited,
+    const Handle(XCAFDoc_ColorTool)& colorTool,
+    AssemblyOut&                     out)
+{
+    TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(productLabel);
+    if (shape.IsNull()) return;
+    // Same recovery as the plain read, but per product: a shell that never
+    // closed is still one body in the source CAD.
+    if (!TopExp_Explorer(shape, TopAbs_SOLID).More()) {
+        shape = try_sew_orphan_faces(shape, nullptr);
+    }
+
+    TCollection_AsciiString entry;
+    TDF_Tool::Entry(productLabel, entry);
+    std::string key(entry.ToCString());
+    auto found = out.index.find(key);
+    if (found == out.index.end()) {
+        found = out.index.emplace(key, (uint32_t)out.products.size()).first;
+        out.products.push_back(rust::String::lossy(label_name(productLabel)));
+    }
+    uint32_t productIndex = found->second;
+
+    // The product's own style is the more specific one; an occurrence style
+    // only fills in where the product has none.
+    Quantity_Color own;
+    const Quantity_Color* style = label_color(colorTool, productLabel, own) ? &own : inherited;
+
+    const gp_Trsf& t = loc.Transformation();
+    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+        out.builder.Add(out.compound, ex.Current().Moved(loc));
+        out.product.push_back(productIndex);
+        out.path.push_back(rust::String::lossy(path));
+        for (int i = 1; i <= 3; i++) {
+            for (int j = 1; j <= 4; j++) out.placement.push_back(t.Value(i, j));
+        }
+        if (style) {
+            out.color.push_back((float)style->Red());
+            out.color.push_back((float)style->Green());
+            out.color.push_back((float)style->Blue());
+            out.color.push_back(1.0f);
+        } else {
+            for (int k = 0; k < 4; k++) out.color.push_back(0.0f);
+        }
+    }
+}
+
+// `depth` only guards against a malformed file referring an assembly into
+// itself; real product structures are a handful of levels deep.
+static void walk_assembly(
+    const TDF_Label&                 label,
+    const std::string&               path,
+    const TopLoc_Location&           loc,
+    const Quantity_Color*            inherited,
+    int                              depth,
+    const Handle(XCAFDoc_ColorTool)& colorTool,
+    AssemblyOut&                     out)
+{
+    if (depth > 64) return;
+    if (!XCAFDoc_ShapeTool::IsAssembly(label)) {
+        emit_solids(label, path, loc, inherited, colorTool, out);
+        return;
+    }
+    NCollection_Sequence<TDF_Label> components;
+    XCAFDoc_ShapeTool::GetComponents(label, components);
+    for (int i = 1; i <= components.Length(); i++) {
+        const TDF_Label& component = components.Value(i);
+        TDF_Label referred;
+        if (!XCAFDoc_ShapeTool::GetReferredShape(component, referred)) referred = component;
+
+        // The occurrence carries the instance name ("M4 Nut v1 (3)"); the
+        // product name is the fallback for exporters that name only products.
+        std::string name = label_name(component);
+        // OCCT appends its own occurrence counter (`605-ZZ:1`). That is
+        // bookkeeping and not a STEP name, and the path already separates
+        // occurrences.
+        size_t colon = name.find_last_of(':');
+        if (colon != std::string::npos && colon + 1 < name.size()
+            && name.find_first_not_of("0123456789", colon + 1) == std::string::npos) {
+            name.resize(colon);
+        }
+        // `=>[0:1:1:76]` is XCAF's own placeholder for a reference it found no
+        // PRODUCT name for — an entry, not a name.
+        if (name.empty() || name.rfind("=>[", 0) == 0) name = label_name(referred);
+
+        Quantity_Color local;
+        const Quantity_Color* style =
+            label_color(colorTool, component, local) ? &local : inherited;
+
+        walk_assembly(
+            referred,
+            path.empty() ? name : path + "/" + name,
+            loc * XCAFDoc_ShapeTool::GetLocation(component),
+            style,
+            depth + 1,
+            colorTool,
+            out);
+    }
+}
+
+std::unique_ptr<TopoDS_Shape> read_step_assembly_stream(
+    RustReader&              reader,
+    rust::Vec<rust::String>& out_products,
+    rust::Vec<uint32_t>&     out_product,
+    rust::Vec<rust::String>& out_path,
+    rust::Vec<double>&       out_placement,
+    rust::Vec<float>&        out_color)
+{
+    try {
+        Handle(TDocStd_Document) doc = new TDocStd_Document("XmlXCAF");
+
+        STEPCAFControl_Reader cafreader;
+        cafreader.SetColorMode(true);
+        cafreader.SetNameMode(true);
+
+        RustReadStreambuf sbuf(reader);
+        std::istream is(&sbuf);
+        if (cafreader.ReadStream("stream", is) != IFSelect_RetDone) {
+            return nullptr;
+        }
+        if (!cafreader.Transfer(doc)) {
+            return nullptr;
+        }
+
+        Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+        Handle(XCAFDoc_ColorTool) colorTool = XCAFDoc_DocumentTool::ColorTool(doc->Main());
+
+        BRep_Builder builder;
+        TopoDS_Compound compound;
+        builder.MakeCompound(compound);
+        AssemblyOut out{
+            out_products, out_product, out_path, out_placement, out_color,
+            builder, compound, {}};
+
+        NCollection_Sequence<TDF_Label> roots;
+        shapeTool->GetFreeShapes(roots);
+        for (int i = 1; i <= roots.Length(); i++) {
+            const TDF_Label& root = roots.Value(i);
+            walk_assembly(
+                root, label_name(root), TopLoc_Location(), nullptr, 0, colorTool, out);
+        }
+
+        return std::make_unique<TopoDS_Shape>(compound);
     } catch (const Standard_Failure&) {
         return nullptr;
     }
