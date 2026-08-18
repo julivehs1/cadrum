@@ -237,6 +237,43 @@ fn link_occt_libraries(occt_include: &Path, occt_lib_dir: &Path, target: &str) {
 	println!("cargo:rerun-if-changed=src/occt/ffi.rs");
 	println!("cargo:rerun-if-changed=cpp/wrapper.h");
 	println!("cargo:rerun-if-changed=cpp/wrapper.cpp");
+
+	emit_kernel_stamp(occt_include);
+}
+
+/// **What produced this geometry** — a stamp for consumers that cache results
+/// on disk across runs.
+///
+/// A cached body or mesh is only valid for the kernel that made it. The crate
+/// version is not enough: this is a local fork under active development, and
+/// changing `wrapper.cpp` without touching `Cargo.toml` is the normal case.
+/// That exact case happened on 2026-08-17 — meshing was switched to run in
+/// parallel, every mesh in every build directory became a different one, and
+/// a cache keyed on the version alone would have kept serving the old ones
+/// without a word.
+///
+/// So the stamp hashes what actually decides the result: the C++ wrapper, its
+/// header, the FFI declarations, and which OCCT the build resolved to.
+fn emit_kernel_stamp(occt_root: &Path) {
+	let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a, 64 bit
+	let mut eat = |bytes: &[u8]| {
+		for &b in bytes {
+			h ^= b as u64;
+			h = h.wrapping_mul(0x1000_0000_01b3);
+		}
+	};
+	for f in ["cpp/wrapper.cpp", "cpp/wrapper.h", "src/occt/ffi.rs"] {
+		// Missing is a legitimate state for a `cfg`-disabled backend; it must
+		// still land in the hash, or present-and-empty would look the same.
+		eat(f.as_bytes());
+		match std::fs::read(f) {
+			Ok(bytes) => eat(&bytes),
+			Err(_) => eat(b"<absent>"),
+		}
+	}
+	eat(occt_root.as_os_str().as_encoded_bytes());
+	eat(env!("CARGO_PKG_VERSION").as_bytes());
+	println!("cargo:rustc-env=CADRUM_KERNEL_STAMP={h:016x}");
 }
 
 /// Provide OCCT into `effective_root` by downloading a prebuilt tarball for `target`.

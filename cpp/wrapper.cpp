@@ -1088,7 +1088,21 @@ MeshData mesh_shape(const TopoDS_Shape& shape, double linear, double angular, bo
     result.success = false;
 
     // BRepMesh_IncrementalMesh(shape, linDeflection, isRelative, angDeflection, isInParallel)
-    BRepMesh_IncrementalMesh mesher(shape, linear, relative, angular, false);
+    //
+    // isInParallel=true meshes the faces of ONE shape across OCCT's own thread
+    // pool (OSD_Parallel). It stays inside this call — no OCCT handle crosses a
+    // Rust thread — so it does not touch the !Send/!Sync property the callers
+    // rely on.
+    //
+    // Measured on an i9-10850K (20 threads) against the Positron assembly, 843
+    // bodies out of a 207 MB .brep: writing the build directory went 27 s ->
+    // 13 s, the whole run 30.2 s -> 15.5 s at 45.3 s user time. The 843 written
+    // meshes are byte-identical to the serial ones (sha256 over all of them).
+    //
+    // A part with many faces wins; a screw with six pays the pool overhead
+    // instead — rustcad's delta printer (96 small meshes) moved only 1.36 s ->
+    // 1.11 s. Nothing measured got slower, so it stays on unconditionally.
+    BRepMesh_IncrementalMesh mesher(shape, linear, relative, angular, true);
     if (!mesher.IsDone()) {
         return result;
     }

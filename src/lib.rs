@@ -11,6 +11,11 @@ pub mod occt;
 // pub mod pure;
 #[cfg(not(feature = "pure"))]
 pub use occt::{edge::Edge, face::Face, solid::History, solid::Solid};
+// Which kernel produced a piece of geometry — for consumers that cache results
+// on disk across runs. Hand-written, and deliberately above the codegen
+// regions further down: `cargo run --example codegen` rewrites those.
+mod stamp;
+pub use stamp::kernel_stamp;
 pub(crate) mod traits;
 // wasm32: no-op WASI/`env` import shims (self-contained wasm). Kept alive by the
 // consumer's wasm init calling `__anchor_wasi_stub` (see its docs).
